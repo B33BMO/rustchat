@@ -247,10 +247,9 @@ fn draw_unlock(frame: &mut Frame, unlock: &Unlock, app: &App) {
 
     lines.push(Line::default());
     if let Some(err) = &unlock.error {
-        lines.push(Line::from(Span::styled(
-            err.clone(),
-            Style::default().fg(BAD),
-        )));
+        for chunk in wrap(err, inner.width as usize) {
+            lines.push(Line::from(Span::styled(chunk, Style::default().fg(BAD))));
+        }
         if unlock.attempts >= 3 {
             lines.push(Line::from(Span::styled(
                 "Forgotten it? `rustchat reset` starts over with the room key.",
@@ -300,6 +299,16 @@ fn draw_setup(frame: &mut Frame, setup: &Setup) {
             lines.push(heading("Paste your invite"));
             lines.push(Line::default());
             lines.push(field(&setup.invite_input, false, inner.width));
+            // Only the tail of a long value fits on screen, so a copy that
+            // lost its opening characters looks perfectly fine. The count is
+            // the one thing that makes a clipped paste visible before Enter.
+            let pasted = setup.invite_input.trim().chars().count();
+            if pasted > 0 {
+                lines.push(Line::from(Span::styled(
+                    format!("  {pasted} characters"),
+                    Style::default().fg(DIM),
+                )));
+            }
             lines.push(Line::default());
             lines.push(note("One value carrying the relay, its access key and a"));
             lines.push(note(
@@ -446,10 +455,12 @@ fn draw_setup(frame: &mut Frame, setup: &Setup) {
 
     if let Some(err) = &setup.error {
         lines.push(Line::default());
-        lines.push(Line::from(Span::styled(
-            err.clone(),
-            Style::default().fg(BAD),
-        )));
+        // Wrapped, not a single line: an error long enough to be genuinely
+        // useful is longer than this card is wide, and an unwrapped one gets
+        // silently cut off at the border with the explanation lost.
+        for chunk in wrap(err, inner.width as usize) {
+            lines.push(Line::from(Span::styled(chunk, Style::default().fg(BAD))));
+        }
     }
 
     frame.render_widget(Paragraph::new(lines), inner);

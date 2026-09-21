@@ -54,9 +54,31 @@ impl Invite {
             .strip_prefix(PREFIX)
             .map(|rest| rest.trim_start_matches('-').to_string())
             .context("not an invite: expected it to start with `rcinv1`")?;
-        let mut payload = BASE32_NOPAD
-            .decode(body.to_uppercase().as_bytes())
-            .context("invite is malformed (bad base32)")?;
+        // A clipped copy-paste is the overwhelmingly likely cause of a bad
+        // invite, and `invalid length at 138` tells nobody that. Say what
+        // actually went wrong.
+        let mut payload = match BASE32_NOPAD.decode(body.to_uppercase().as_bytes()) {
+            Ok(payload) => payload,
+            Err(err) => match err.kind {
+                // Both of these come from cutting an invite mid-group: an
+                // impossible total length, or a final group with stray bits.
+                data_encoding::DecodeKind::Length | data_encoding::DecodeKind::Trailing => {
+                    bail!(
+                        "this invite is {} characters long, which can't be a whole one — \
+                         the copy looks clipped. Copy the entire value, starting at \
+                         `rcinv1-`.",
+                        cleaned.len()
+                    )
+                }
+                data_encoding::DecodeKind::Symbol => bail!(
+                    "this invite has a character that doesn't belong in one (at position \
+                     {}). Invites use only the letters A-Z and the digits 2-7, so \
+                     something mangled it in transit — ask for a fresh one.",
+                    err.position + PREFIX.len() + 1
+                ),
+                _ => bail!("this invite is malformed; ask for a fresh one"),
+            },
+        };
 
         let result = Self::from_payload(&payload);
         payload.zeroize();
@@ -67,7 +89,7 @@ impl Invite {
         // Every length is checked before use: an invite arrives from outside
         // and a truncated one must be an error, never a panic.
         if payload.len() < 2 + 32 + 1 {
-            bail!("invite is truncated");
+            bail!("this invite is too short to be a whole one — the copy looks clipped");
         }
         if payload[0] != FORMAT_VERSION {
             bail!(
@@ -84,7 +106,7 @@ impl Invite {
 
         let room = if has_room {
             if payload.len() < at + 32 + 1 {
-                bail!("invite is truncated");
+                bail!("this invite is missing part of its room key — the copy looks clipped");
             }
             let bytes = <[u8; 32]>::try_from(&payload[at..at + 32])
                 .map_err(|_| anyhow::anyhow!("invite is truncated"))?;
@@ -95,7 +117,7 @@ impl Invite {
         };
 
         if payload.len() <= at {
-            bail!("invite is truncated");
+            bail!("this invite is missing its relay address — the copy looks clipped");
         }
         let url_len = payload[at] as usize;
         at += 1;
@@ -103,7 +125,7 @@ impl Invite {
             bail!("invite carries no relay address");
         }
         if url_len > MAX_URL_BYTES || payload.len() < at + url_len {
-            bail!("invite is malformed (bad relay address length)");
+            bail!("this invite's relay address is cut short — the copy looks clipped");
         }
         let relay_url = std::str::from_utf8(&payload[at..at + url_len])
             .context("invite's relay address is not valid UTF-8")?
@@ -190,12 +212,57 @@ mod tests {
         assert!(Invite::decode("rcinv1-!!!!").is_err());
         assert!(Invite::decode("rcinv1-").is_err());
         let token = sample(true).encode();
-        for cut in [10, 20, 40, token.len() - 4] {
+        for cut in 8..token.len() {
             assert!(
                 Invite::decode(&token[..cut]).is_err(),
                 "a truncated invite must not decode (cut at {cut})"
             );
         }
+    }
+
+    #[test]
+    fn every_clipped_invite_says_it_is_clipped() {
+        // The real-world failure is a copy that missed the last few
+        // characters. Whether that lands on an invalid base32 length or
+        // merely a short payload is an implementation detail; the person
+        // pasting it needs to be told it was clipped either way.
+        let token = sample(true).encode();
+        for cut in 8..token.len() {
+            let err = Invite::decode(&token[..cut]).unwrap_err().to_string();
+            assert!(
+                err.contains("clipped"),
+                "truncating to {cut} chars gave an unhelpful error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_invalid_length_reports_the_length_seen() {
+        // So the person can compare it against the value they meant to copy.
+        let token = sample(true).encode();
+        let clipped = (8..token.len())
+            .map(|cut| &token[..cut])
+            .find(|candidate| {
+                let body = &candidate[PREFIX.len() + 1..];
+                !matches!(body.len() % 8, 0 | 2 | 4 | 5 | 7)
+            })
+            .expect("some truncation must produce an invalid base32 length");
+        let err = Invite::decode(clipped).unwrap_err().to_string();
+        assert!(
+            err.contains(&clipped.len().to_string()),
+            "expected the length {} in: {err}",
+            clipped.len()
+        );
+    }
+
+    #[test]
+    fn a_mangled_character_is_reported_distinctly() {
+        let mut token = sample(true).encode();
+        // `1` is not in the base32 alphabet, and is a plausible mistyping of I.
+        let at = token.len() - 10;
+        token.replace_range(at..at + 1, "1");
+        let err = Invite::decode(&token).unwrap_err().to_string();
+        assert!(err.contains("doesn't belong"), "got: {err}");
     }
 
     #[test]
