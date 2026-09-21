@@ -1,0 +1,33 @@
+[package]
+name = "rustchat"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "An end-to-end encrypted TUI chatroom."
+
+[[bin]]
+name = "rustchat"
+path = "src/main.rs"
+
+[dependencies]
+rustchat-core = { path = "../core" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+zeroize.workspace = true
+ratatui = "0.30"
+crossterm = { version = "0.29", features = ["event-stream"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+# rustls 0.23 ships no backend by default and panics on first use if it cannot
+# pick one. `ring` is chosen over aws-lc-rs because it cross-compiles to musl
+# without cmake or a C++ toolchain, which is what keeps the static Linux build
+# simple. The provider is also installed explicitly in main(); see there.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+futures-util = "0.3"
+clap = { version = "4", features = ["derive", "env"] }
+dirs = "6"
+unicode-width = "0.2"
+base64.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

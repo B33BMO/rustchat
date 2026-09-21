@@ -1,0 +1,128 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag to build and release
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+
+      - name: Install musl tooling
+        if: endsWith(matrix.target, '-musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # One tarball per binary, so the installer only pulls what it needs:
+      # most people never want the relay.
+      - name: Package
+        run: |
+          set -eux
+          out="target/${{ matrix.target }}/release"
+          mkdir -p dist
+          for bin in rustchat rustchat-relay; do
+            tar -czf "dist/$bin-${{ matrix.target }}.tar.gz" -C "$out" "$bin"
+          done
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: staging
+          pattern: dist-*
+          merge-multiple: true
+
+      # The installer refuses to install anything absent from this file, so it
+      # has to cover every asset and be generated from the actual artifacts.
+      - name: Checksum every asset
+        run: |
+          set -eux
+          cd staging
+          sha256sum *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Sanity-check the Linux binary
+        run: |
+          set -eux
+          cd staging
+          tar -xzf rustchat-x86_64-unknown-linux-musl.tar.gz
+          ./rustchat --version
+          rm -f rustchat
+
+      - name: Resolve tag
+        id: tag
+        run: echo "tag=${{ github.event.inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          files: staging/*
+          generate_release_notes: true
+          body: |
+            ## Install
+
+            ```sh
+            curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | sh
+            ```
+
+            To host a room, add `--relay`:
+
+            ```sh
+            curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | sh -s -- --relay
+            ```
+
+            Every asset below is listed in `SHA256SUMS`, and the installer
+            refuses anything whose checksum doesn't match.
