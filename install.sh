@@ -135,11 +135,24 @@ detect_target() {
 }
 
 fetch() {
-    # $1 url, $2 destination ("-" for stdout)
+    # $1 url, $2 destination ("-" for stdout).
+    #
+    # Retries on transient failures. Without this, a single 5xx from a CDN --
+    # which GitHub serves fairly readily just after a release is published --
+    # looks identical to a missing asset, and sends everyone down the
+    # compile-from-source path for no reason.
     if have curl; then
-        if [ "$2" = "-" ]; then curl -fsSL "$1"; else curl -fsSL "$1" -o "$2"; fi
+        if [ "$2" = "-" ]; then
+            curl -fsSL --retry 3 --retry-delay 2 --retry-connrefused "$1"
+        else
+            curl -fsSL --retry 3 --retry-delay 2 --retry-connrefused "$1" -o "$2"
+        fi
     elif have wget; then
-        if [ "$2" = "-" ]; then wget -qO- "$1"; else wget -qO "$2" "$1"; fi
+        if [ "$2" = "-" ]; then
+            wget -q --tries=3 --waitretry=2 -O- "$1"
+        else
+            wget -q --tries=3 --waitretry=2 -O "$2" "$1"
+        fi
     else
         die "need curl or wget"
     fi
@@ -245,7 +258,7 @@ fi
 # The checksum file covers every asset in the release.
 step "Downloading checksums"
 if ! fetch "$base/SHA256SUMS" "$TMP/SHA256SUMS" 2>/dev/null; then
-    build_from_source "release $VERSION has no SHA256SUMS; not installing an unverified binary."
+    build_from_source "could not fetch SHA256SUMS for $VERSION (missing, or the download failed); not installing an unverified binary."
 fi
 
 binaries="rustchat"
@@ -255,7 +268,7 @@ for bin in $binaries; do
     asset="$bin-$target.tar.gz"
     step "Downloading $asset"
     if ! fetch "$base/$asset" "$TMP/$asset" 2>/dev/null; then
-        build_from_source "release $VERSION has no $asset."
+        build_from_source "could not fetch $asset (missing, or the download failed)."
     fi
 
     expected=$(grep " $asset\$" "$TMP/SHA256SUMS" 2>/dev/null | cut -d' ' -f1 || true)

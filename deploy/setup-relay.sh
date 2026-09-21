@@ -65,14 +65,14 @@ else
         aarch64|arm64) target=aarch64-unknown-linux-musl ;;
         *) die "no prebuilt relay for $arch — build it with 'cargo build --release'" ;;
     esac
-    tag=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
+    tag=$(curl -fsSL --retry 3 --retry-delay 2 "https://api.github.com/repos/$REPO/releases/latest" \
         | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
     [ -n "$tag" ] || die "could not find the latest release"
     tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
     base="https://github.com/$REPO/releases/download/$tag"
-    curl -fsSL "$base/SHA256SUMS" -o "$tmp/SHA256SUMS" || die "could not fetch SHA256SUMS"
+    curl -fsSL --retry 3 --retry-delay 2 "$base/SHA256SUMS" -o "$tmp/SHA256SUMS" || die "could not fetch SHA256SUMS"
     asset="rustchat-relay-$target.tar.gz"
-    curl -fsSL "$base/$asset" -o "$tmp/$asset" || die "could not fetch $asset"
+    curl -fsSL --retry 3 --retry-delay 2 "$base/$asset" -o "$tmp/$asset" || die "could not fetch $asset"
     expected=$(grep " $asset\$" "$tmp/SHA256SUMS" | cut -d' ' -f1)
     [ -n "$expected" ] || die "$asset is not listed in SHA256SUMS"
     actual=$(sha256sum "$tmp/$asset" | cut -d' ' -f1)
