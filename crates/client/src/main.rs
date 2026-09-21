@@ -489,18 +489,25 @@ async fn handle_net_event(
             }
         }
         NetEvent::History(payloads) => {
-            let count = payloads.len();
-            for payload in payloads {
-                app.absorb(payload, true);
-            }
-            if count > 0 {
+            // Count only what will actually appear: replayed presence is
+            // dropped, so counting every payload overstates it. And label the
+            // batch *before* absorbing it, so the marker reads as a heading
+            // for the lines below rather than a footnote after them.
+            let shown = payloads
+                .iter()
+                .filter(|payload| matches!(payload, Payload::Msg { .. }))
+                .count();
+            if shown > 0 {
                 app.system(
                     format!(
-                        "— {count} recent line{} from the relay —",
-                        app::plural(count)
+                        "— {shown} earlier line{} from the relay —",
+                        app::plural(shown)
                     ),
                     Level::Info,
                 );
+            }
+            for payload in payloads {
+                app.absorb(payload, true);
             }
         }
         NetEvent::Payload(payload) => app.absorb(payload, false),
