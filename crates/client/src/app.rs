@@ -244,15 +244,17 @@ impl App {
                 });
             }
             // Presence is noise in a replayed backlog: "bmo joined" from two
-            // hours ago tells you nothing about who is here now.
-            Payload::Join { user, ts } if !from_history => {
+            // hours ago tells you nothing about who is here now. Your own
+            // arrival is noise too — the connection line above already said
+            // it, and "you joined" reads oddly in your own transcript.
+            Payload::Join { user, ts } if !from_history && user != self.username => {
                 self.entries.push(Entry::Presence {
                     user,
                     joined: true,
                     ts,
                 });
             }
-            Payload::Leave { user, ts } if !from_history => {
+            Payload::Leave { user, ts } if !from_history && user != self.username => {
                 self.entries.push(Entry::Presence {
                     user,
                     joined: false,
@@ -280,6 +282,11 @@ impl App {
             return;
         }
         let count = lines.len();
+        // Before the lines, not after: it is a heading for what follows.
+        self.system(
+            format!("— {count} earlier line{} from your vault —", plural(count)),
+            Level::Info,
+        );
         for line in lines {
             let own = line.user == self.username;
             self.entries.push(Entry::Msg {
@@ -289,10 +296,6 @@ impl App {
                 own,
             });
         }
-        self.system(
-            format!("— {count} earlier line{} from your vault —", plural(count)),
-            Level::Info,
-        );
     }
 
     /// Routes a key press to whichever screen is in front.
@@ -1021,5 +1024,49 @@ mod tests {
             );
         }
         assert!(app.entries.len() <= 2000);
+    }
+
+    #[test]
+    fn your_own_presence_is_not_shown_to_you() {
+        let mut app = app(); // username is "bmo"
+        app.absorb(
+            Payload::Join {
+                user: "bmo".into(),
+                ts: 0,
+            },
+            false,
+        );
+        app.absorb(
+            Payload::Leave {
+                user: "bmo".into(),
+                ts: 0,
+            },
+            false,
+        );
+        assert!(app.entries.is_empty(), "you already know you joined");
+        app.absorb(
+            Payload::Join {
+                user: "sam".into(),
+                ts: 0,
+            },
+            false,
+        );
+        assert_eq!(app.entries.len(), 1, "other people's presence still shows");
+    }
+
+    #[test]
+    fn the_vault_history_marker_precedes_its_lines() {
+        let mut app = app();
+        app.vault.push_line(StoredLine {
+            user: "sam".into(),
+            body: "older".into(),
+            ts: 1,
+        });
+        app.load_history();
+        assert!(
+            matches!(app.entries.first(), Some(Entry::System { .. })),
+            "the marker should head the lines it describes, not trail them"
+        );
+        assert!(matches!(app.entries.last(), Some(Entry::Msg { .. })));
     }
 }

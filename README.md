@@ -7,26 +7,7 @@ pick a name, and talk. Messages are sealed on your machine and opened on
 everyone else's, so the relay carrying them only ever handles ciphertext — it
 cannot read the rooms it serves, and is configured with no room keys at all.
 
-```
- rustchat relay.bmo.guru                                          ● online · 3 here
-
-bmo (you)  09:23
-   hey, did the relay deploy land?
-
-sam  09:23
-   yeah, it's behind the tunnel now
-
-bmo (you)  09:24
-   nice. the relay can't read any of this, right?
-
-sam  09:24
-   right — it only ever sees ciphertext
- · 3 connections in the room. The relay can't tell you who — it doesn't know.
-
-╭ message ──────────────────────────────────────────────────────────────────────────╮
-│ good                                                                             │
-╰──────────────────────────────────────────────────────────────────────────────────╯
-```
+![rustchat](docs/demo.gif)
 
 ## Install
 
@@ -307,6 +288,20 @@ crates/relay   the broadcast hub
 cargo test --workspace   # unit tests + end-to-end against the real relay binary
 cargo clippy --workspace --all-targets
 ```
+
+The README's GIF is generated, not hand-made:
+
+```sh
+cargo build --release
+sh docs/record-demo.sh
+```
+
+That starts a relay on loopback with throwaway keys and runs
+`docs/demo-partner.py`, which joins the same room in a pty nothing is
+recording and plays the other half of the conversation — each of its lines
+triggered by a word appearing from the recorded side, so the two halves stay
+in step however long the render takes to start. `docs/demo.tape` is the VHS
+script.
 
 The integration tests in `crates/relay/tests/` drive the actual relay binary
 over a real socket, including the cases that matter: a wrong access key gets
