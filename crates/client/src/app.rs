@@ -368,11 +368,16 @@ impl App {
         // Enter: validate the current step and move on.
         match setup.step {
             Step::Mode => {
+                // Joining is first and default: most people arrive holding a
+                // key somebody sent them. Creating a room generates a *new*
+                // key, which silently will not match a relay configured for a
+                // different room — so it must be chosen deliberately, never
+                // landed on by pressing Enter.
                 if setup.mode_cursor == 0 {
+                    setup.step = Step::EnterKey;
+                } else {
                     setup.room_key = Some(RoomKey::generate());
                     setup.step = Step::ShowKey;
-                } else {
-                    setup.step = Step::EnterKey;
                 }
             }
             Step::ShowKey => setup.step = Step::Relay,

@@ -98,7 +98,11 @@ Relay auth key (for the relay's --auth-key / RUSTCHAT_AUTH_KEY):
 ```
 
 Hand the **room key** to the people you want in the room. Give the **auth key**
-to the relay. The auth key is derived one-way from the room key: it is enough
+to the relay. If you already have a room key and need its auth key again — to
+check a relay is configured for the room you think it is, or to add a second
+relay — `rustchat authkey <room key>` derives it.
+
+The auth key is derived one-way from the room key: it is enough
 to turn away clients who don't know the room key, and useless for reading
 anything. A relay operator who is entirely untrustworthy still learns nothing
 but message sizes and timing.
@@ -154,11 +158,33 @@ rustchat --relay wss://elsewhere/ws     # a different relay, just this once
 rustchat --room-key rc1-…               # skip the vault entirely
 rustchat --no-vault                     # touch no disk at all
 rustchat where                          # where the vault lives
-rustchat reset                          # delete the vault
+rustchat reset                          # delete the vault and start over
+rustchat authkey <room key>             # the auth key a relay needs for that room
 ```
 
 `RUSTCHAT_ROOM_KEY` does the same as `--room-key` without putting the key in
 your shell history or in `ps` output.
+
+### "the relay turned us away"
+
+The relay only accepts clients that can prove they hold the room key it was
+configured for. If you see this, the key you are using is not that key. Most
+often the key was created rather than joined — a brand-new room key is
+perfectly valid and matches no existing relay.
+
+Check whether your key and the relay belong together:
+
+```sh
+rustchat authkey <your room key>     # compare with RUSTCHAT_AUTH_KEY on the relay
+```
+
+If they differ, the rejected key is already saved in your vault, so relaunching
+fails identically. Clear it and rejoin:
+
+```sh
+rustchat reset
+rustchat          # choose "Join a room" and paste the key you were given
+```
 
 ## How it works
 
