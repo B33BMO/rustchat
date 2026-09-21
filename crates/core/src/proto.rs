@@ -2,13 +2,15 @@
 //!
 //! Two layers sit on one WebSocket. The **outer** layer ([`ClientMsg`] /
 //! [`RelayMsg`]) is plaintext JSON the relay reads and acts on: a
-//! challenge/response handshake, then sealed envelopes it shuttles around. The
-//! **inner** layer ([`Payload`]) is JSON sealed under the room key's message
-//! subkey, and the relay has no way to read it.
+//! challenge/response handshake naming a room, then sealed envelopes it
+//! shuttles between everyone in that room. The **inner** layer ([`Payload`])
+//! is JSON sealed under the room key's message subkey, which the relay has no
+//! way to read.
 //!
 //! Everything a human would care about — who is speaking, what they said, when
-//! they joined — lives in the inner layer. The relay's view of a room is a
-//! count of sockets and a pile of opaque bytes.
+//! they joined — lives in the inner layer. The relay's view of a room is a room
+//! id, a count of sockets and a pile of opaque bytes. It is configured with no
+//! room keys at all, which is what lets one relay carry any number of rooms.
 
 use serde::{Deserialize, Serialize};
 
@@ -25,9 +27,13 @@ pub struct SealedEnvelope {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum ClientMsg {
-    /// Answers [`RelayMsg::Challenge`]. `proof` is base64 of
-    /// `BLAKE3(auth_key, challenge)`.
-    Auth { v: u16, proof: String },
+    /// Answers [`RelayMsg::Challenge`] and names the room to join.
+    ///
+    /// `proof` is base64 of `BLAKE3(access_auth_key, challenge)`, proving the
+    /// client may use this relay at all. `room` is the hex room id — a one-way
+    /// derivation of the room key, so naming a room here reveals nothing about
+    /// its contents. Rooms spring into existence on first join.
+    Auth { v: u16, proof: String, room: String },
     /// Publishes a sealed payload to the room.
     Send { env: SealedEnvelope },
     /// Keepalive.
@@ -40,13 +46,15 @@ pub enum ClientMsg {
 pub enum RelayMsg {
     /// Opens the handshake with a fresh random nonce, base64.
     Challenge { v: u16, nonce: String },
-    /// Handshake accepted. `occupants` counts sockets, including this one.
+    /// Handshake accepted and the room joined. `occupants` counts sockets in
+    /// *this room*, including this one.
     Welcome { occupants: usize },
     /// Recent traffic, oldest first, replayed on join.
     History { envs: Vec<SealedEnvelope> },
     /// A sealed payload from some member of the room.
     Msg { env: SealedEnvelope },
-    /// Socket count changed. Carries no identity — the relay doesn't know any.
+    /// This room's socket count changed. Carries no identity — the relay
+    /// doesn't know any.
     Occupants { occupants: usize },
     /// Terminal error; the relay closes the socket after sending this.
     Error { reason: String },
@@ -142,6 +150,7 @@ mod tests {
         let msg = ClientMsg::Auth {
             v: crate::PROTOCOL_VERSION,
             proof: "abc".into(),
+            room: "ff00".into(),
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"t\":\"auth\""));

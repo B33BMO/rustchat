@@ -10,7 +10,9 @@ use std::time::Duration;
 
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
-use rustchat_core::{ClientMsg, PROTOCOL_VERSION, Payload, RelayMsg, RoomKey, SealedEnvelope};
+use rustchat_core::{
+    AccessKey, ClientMsg, PROTOCOL_VERSION, Payload, RelayMsg, RoomKey, SealedEnvelope,
+};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio_tungstenite::tungstenite::Message;
 
@@ -105,8 +107,8 @@ async fn send(socket: &mut Socket, msg: &ClientMsg) {
         .expect("sending to the relay");
 }
 
-/// Connects and completes the handshake with the given room key.
-async fn join(url: &str, key: &RoomKey) -> Socket {
+/// Connects, proves relay access, and joins the room named by `room`.
+async fn join(url: &str, access: &AccessKey, room: &RoomKey) -> Socket {
     let (mut socket, _) = tokio_tungstenite::connect_async(url)
         .await
         .expect("connecting to the relay");
@@ -114,12 +116,12 @@ async fn join(url: &str, key: &RoomKey) -> Socket {
         panic!("expected a challenge");
     };
     assert_eq!(v, PROTOCOL_VERSION);
-    let proof = key.derive().prove(&unb64(&nonce));
     send(
         &mut socket,
         &ClientMsg::Auth {
             v: PROTOCOL_VERSION,
-            proof: b64(&proof),
+            proof: b64(&access.prove(&unb64(&nonce))),
+            room: room.room_id_hex(),
         },
     )
     .await;
@@ -152,11 +154,12 @@ fn open_envelope(key: &RoomKey, env: &SealedEnvelope) -> Payload {
 
 #[tokio::test]
 async fn two_members_can_talk_to_each_other() {
+    let access = AccessKey::generate();
     let key = RoomKey::generate();
-    let relay = start_relay(&key.derive().auth_hex(), 200).await;
+    let relay = start_relay(&access.auth_hex(), 200).await;
 
-    let mut alice = join(&relay.url, &key).await;
-    let mut bob = join(&relay.url, &key).await;
+    let mut alice = join(&relay.url, &access, &key).await;
+    let mut bob = join(&relay.url, &access, &key).await;
 
     send(
         &mut alice,
@@ -186,9 +189,10 @@ async fn two_members_can_talk_to_each_other() {
 #[tokio::test]
 async fn the_sender_sees_its_own_message() {
     // Every client renders on receive, so the whole room shares one ordering.
+    let access = AccessKey::generate();
     let key = RoomKey::generate();
-    let relay = start_relay(&key.derive().auth_hex(), 200).await;
-    let mut alice = join(&relay.url, &key).await;
+    let relay = start_relay(&access.auth_hex(), 200).await;
+    let mut alice = join(&relay.url, &access, &key).await;
 
     send(
         &mut alice,
@@ -215,10 +219,11 @@ async fn the_sender_sees_its_own_message() {
 
 #[tokio::test]
 async fn a_late_joiner_gets_the_backlog() {
+    let access = AccessKey::generate();
     let key = RoomKey::generate();
-    let relay = start_relay(&key.derive().auth_hex(), 200).await;
+    let relay = start_relay(&access.auth_hex(), 200).await;
 
-    let mut alice = join(&relay.url, &key).await;
+    let mut alice = join(&relay.url, &access, &key).await;
     send(
         &mut alice,
         &ClientMsg::Send {
@@ -229,7 +234,7 @@ async fn a_late_joiner_gets_the_backlog() {
     // Let the relay commit it to the ring buffer before the next client joins.
     let _ = next_msg(&mut alice).await;
 
-    let mut bob = join(&relay.url, &key).await;
+    let mut bob = join(&relay.url, &access, &key).await;
     let envs = loop {
         match next_msg(&mut bob).await {
             Some(RelayMsg::History { envs }) => break envs,
@@ -246,10 +251,11 @@ async fn a_late_joiner_gets_the_backlog() {
 
 #[tokio::test]
 async fn history_can_be_switched_off() {
+    let access = AccessKey::generate();
     let key = RoomKey::generate();
-    let relay = start_relay(&key.derive().auth_hex(), 0).await;
+    let relay = start_relay(&access.auth_hex(), 0).await;
 
-    let mut alice = join(&relay.url, &key).await;
+    let mut alice = join(&relay.url, &access, &key).await;
     send(
         &mut alice,
         &ClientMsg::Send {
@@ -259,7 +265,7 @@ async fn history_can_be_switched_off() {
     .await;
     let _ = next_msg(&mut alice).await;
 
-    let mut bob = join(&relay.url, &key).await;
+    let mut bob = join(&relay.url, &access, &key).await;
     send(&mut bob, &ClientMsg::Ping).await;
     loop {
         match next_msg(&mut bob).await {
@@ -272,10 +278,10 @@ async fn history_can_be_switched_off() {
 }
 
 #[tokio::test]
-async fn the_wrong_room_key_is_turned_away() {
-    let real = RoomKey::generate();
-    let impostor = RoomKey::generate();
-    let relay = start_relay(&real.derive().auth_hex(), 200).await;
+async fn the_wrong_access_key_is_turned_away() {
+    let real = AccessKey::generate();
+    let impostor = AccessKey::generate();
+    let relay = start_relay(&real.auth_hex(), 200).await;
 
     let (mut socket, _) = tokio_tungstenite::connect_async(&relay.url)
         .await
@@ -287,7 +293,8 @@ async fn the_wrong_room_key_is_turned_away() {
         &mut socket,
         &ClientMsg::Auth {
             v: PROTOCOL_VERSION,
-            proof: b64(&impostor.derive().prove(&unb64(&nonce))),
+            proof: b64(&impostor.prove(&unb64(&nonce))),
+            room: RoomKey::generate().room_id_hex(),
         },
     )
     .await;
@@ -300,8 +307,8 @@ async fn the_wrong_room_key_is_turned_away() {
 
 #[tokio::test]
 async fn a_mismatched_protocol_version_is_turned_away() {
-    let key = RoomKey::generate();
-    let relay = start_relay(&key.derive().auth_hex(), 200).await;
+    let access = AccessKey::generate();
+    let relay = start_relay(&access.auth_hex(), 200).await;
 
     let (mut socket, _) = tokio_tungstenite::connect_async(&relay.url)
         .await
@@ -313,7 +320,8 @@ async fn a_mismatched_protocol_version_is_turned_away() {
         &mut socket,
         &ClientMsg::Auth {
             v: PROTOCOL_VERSION + 99,
-            proof: b64(&key.derive().prove(&unb64(&nonce))),
+            proof: b64(&access.prove(&unb64(&nonce))),
+            room: RoomKey::generate().room_id_hex(),
         },
     )
     .await;
@@ -326,8 +334,9 @@ async fn a_mismatched_protocol_version_is_turned_away() {
 
 #[tokio::test]
 async fn messages_cannot_be_sent_before_authenticating() {
+    let access = AccessKey::generate();
     let key = RoomKey::generate();
-    let relay = start_relay(&key.derive().auth_hex(), 200).await;
+    let relay = start_relay(&access.auth_hex(), 200).await;
 
     let (mut socket, _) = tokio_tungstenite::connect_async(&relay.url)
         .await
@@ -367,20 +376,26 @@ async fn the_relay_never_sees_plaintext() {
         !String::from_utf8_lossy(&ciphertext).contains("alice"),
         "the username should not be readable in the envelope either"
     );
-    // Everything the relay holds, used against the payload, gets nowhere.
+    // Everything the relay holds, used against the payload, gets nowhere: it
+    // has the room id and an access auth key, and neither opens anything.
     assert!(
-        rustchat_core::open(&keys.auth, &unb64(&env.n), &ciphertext).is_err(),
-        "the auth key must not open a message"
+        rustchat_core::open(&keys.room_id, &unb64(&env.n), &ciphertext).is_err(),
+        "the room id must not open a message"
+    );
+    assert!(
+        rustchat_core::open(&AccessKey::generate().auth(), &unb64(&env.n), &ciphertext).is_err(),
+        "an access auth key must not open a message"
     );
 }
 
 #[tokio::test]
 async fn occupancy_is_reported_as_people_come_and_go() {
+    let access = AccessKey::generate();
     let key = RoomKey::generate();
-    let relay = start_relay(&key.derive().auth_hex(), 200).await;
+    let relay = start_relay(&access.auth_hex(), 200).await;
 
-    let mut alice = join(&relay.url, &key).await;
-    let bob = join(&relay.url, &key).await;
+    let mut alice = join(&relay.url, &access, &key).await;
+    let bob = join(&relay.url, &access, &key).await;
 
     // Alice should be told the room grew to two.
     let count = loop {
@@ -401,4 +416,184 @@ async fn occupancy_is_reported_as_people_come_and_go() {
         }
     };
     assert_eq!(count, 1, "leaving should be reflected in the count");
+}
+
+// --- multi-room behaviour --------------------------------------------------
+
+#[tokio::test]
+async fn a_room_can_be_created_just_by_joining_it() {
+    // The whole point of protocol v2: the relay is configured with no room
+    // keys, so a brand-new room key works immediately with no server change.
+    let access = AccessKey::generate();
+    let relay = start_relay(&access.auth_hex(), 200).await;
+
+    let brand_new = RoomKey::generate();
+    let mut alice = join(&relay.url, &access, &brand_new).await;
+    let mut bob = join(&relay.url, &access, &brand_new).await;
+
+    send(
+        &mut alice,
+        &ClientMsg::Send {
+            env: sealed(&brand_new, "alice", "fresh room"),
+        },
+    )
+    .await;
+
+    loop {
+        match next_msg(&mut bob).await {
+            Some(RelayMsg::Msg { env }) => {
+                assert!(matches!(
+                    open_envelope(&brand_new, &env),
+                    Payload::Msg { ref body, .. } if body == "fresh room"
+                ));
+                break;
+            }
+            Some(RelayMsg::Occupants { .. }) => continue,
+            other => panic!("expected a message in the new room, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn rooms_do_not_leak_into_each_other() {
+    let access = AccessKey::generate();
+    let relay = start_relay(&access.auth_hex(), 200).await;
+    let room_a = RoomKey::generate();
+    let room_b = RoomKey::generate();
+
+    let mut alice = join(&relay.url, &access, &room_a).await;
+    let mut bob = join(&relay.url, &access, &room_b).await;
+
+    send(
+        &mut alice,
+        &ClientMsg::Send {
+            env: sealed(&room_a, "alice", "only for room a"),
+        },
+    )
+    .await;
+    // Alice must see her own message, so the relay has certainly processed it.
+    loop {
+        match next_msg(&mut alice).await {
+            Some(RelayMsg::Msg { .. }) => break,
+            Some(RelayMsg::Occupants { .. }) => continue,
+            other => panic!("expected an echo, got {other:?}"),
+        }
+    }
+
+    // Bob is in another room. A round-trip ping proves the relay is still
+    // talking to him, and that nothing from room A arrived in the meantime.
+    send(&mut bob, &ClientMsg::Ping).await;
+    loop {
+        match next_msg(&mut bob).await {
+            Some(RelayMsg::Pong) => break,
+            Some(RelayMsg::Occupants { .. }) => continue,
+            Some(RelayMsg::Msg { .. }) => panic!("a message crossed between rooms"),
+            Some(RelayMsg::History { .. }) => panic!("another room's history leaked"),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn occupancy_is_counted_per_room() {
+    let access = AccessKey::generate();
+    let relay = start_relay(&access.auth_hex(), 200).await;
+    let room_a = RoomKey::generate();
+    let room_b = RoomKey::generate();
+
+    let mut alice = join(&relay.url, &access, &room_a).await;
+    // Two people join a different room; alice's count must stay at 1.
+    let _b1 = join(&relay.url, &access, &room_b).await;
+    let _b2 = join(&relay.url, &access, &room_b).await;
+
+    send(&mut alice, &ClientMsg::Ping).await;
+    loop {
+        match next_msg(&mut alice).await {
+            Some(RelayMsg::Pong) => break,
+            Some(RelayMsg::Occupants { occupants }) => {
+                assert_eq!(occupants, 1, "another room's occupants were counted");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn history_is_per_room() {
+    let access = AccessKey::generate();
+    let relay = start_relay(&access.auth_hex(), 200).await;
+    let room_a = RoomKey::generate();
+    let room_b = RoomKey::generate();
+
+    let mut alice = join(&relay.url, &access, &room_a).await;
+    send(
+        &mut alice,
+        &ClientMsg::Send {
+            env: sealed(&room_a, "alice", "room a backlog"),
+        },
+    )
+    .await;
+    let _ = next_msg(&mut alice).await;
+
+    // A newcomer to room B must get room B's (empty) history, not room A's.
+    let mut bob = join(&relay.url, &access, &room_b).await;
+    send(&mut bob, &ClientMsg::Ping).await;
+    loop {
+        match next_msg(&mut bob).await {
+            Some(RelayMsg::Pong) => break,
+            Some(RelayMsg::Occupants { .. }) => continue,
+            Some(RelayMsg::History { .. }) => panic!("room A's history reached room B"),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_malformed_room_id_is_refused() {
+    let access = AccessKey::generate();
+    let relay = start_relay(&access.auth_hex(), 200).await;
+
+    let (mut socket, _) = tokio_tungstenite::connect_async(&relay.url)
+        .await
+        .expect("connecting");
+    let Some(RelayMsg::Challenge { nonce, .. }) = next_msg(&mut socket).await else {
+        panic!("expected a challenge");
+    };
+    send(
+        &mut socket,
+        &ClientMsg::Auth {
+            v: PROTOCOL_VERSION,
+            proof: b64(&access.prove(&unb64(&nonce))),
+            room: "not-a-room-id".into(),
+        },
+    )
+    .await;
+
+    match next_msg(&mut socket).await {
+        Some(RelayMsg::Error { .. }) | None => {}
+        other => panic!("a malformed room id must be refused, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn the_relay_cannot_tell_which_room_key_produced_an_id() {
+    // The relay sees room ids. This asserts the one-way property that makes
+    // handing them over safe.
+    let key = RoomKey::generate();
+    let id = key.room_id_hex();
+    assert_ne!(id, hex(key.as_bytes()), "the id must not be the key itself");
+    assert_ne!(
+        id,
+        hex(&key.derive().msg),
+        "the id must not be the message key"
+    );
+    assert_ne!(
+        id,
+        RoomKey::generate().room_id_hex(),
+        "different keys must give different ids"
+    );
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }

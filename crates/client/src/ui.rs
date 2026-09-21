@@ -296,6 +296,36 @@ fn draw_setup(frame: &mut Frame, setup: &Setup) {
     let note = |text: &str| Line::from(Span::styled(text.to_string(), Style::default().fg(DIM)));
 
     match setup.step {
+        Step::Invite => {
+            lines.push(heading("Paste your invite"));
+            lines.push(Line::default());
+            lines.push(field(&setup.invite_input, false, inner.width));
+            lines.push(Line::default());
+            lines.push(note("One value carrying the relay, its access key and a"));
+            lines.push(note(
+                "room key. Whoever runs the relay can make you one with",
+            ));
+            lines.push(note("`rustchat invite`, or /invite from inside a room."));
+            lines.push(Line::default());
+            lines.push(note(
+                "No invite? Leave this blank and press Enter to fill in",
+            ));
+            lines.push(note("each part yourself."));
+        }
+        Step::Access => {
+            lines.push(heading("Relay access key"));
+            lines.push(Line::default());
+            lines.push(field(&setup.access_input, false, inner.width));
+            lines.push(Line::default());
+            lines.push(note(
+                "Starts with `rca1`. It decides who may use the relay at",
+            ));
+            lines.push(note("all — it is not a room key and cannot read any room."));
+            lines.push(Line::default());
+            lines.push(note(
+                "Running the relay yourself? `rustchat relaykey` makes one.",
+            ));
+        }
         Step::Mode => {
             lines.push(heading("Join a room, or start one"));
             lines.push(Line::default());
@@ -321,15 +351,13 @@ fn draw_setup(frame: &mut Frame, setup: &Setup) {
             }
             lines.push(Line::default());
             if setup.mode_cursor == 1 {
-                lines.push(note(
-                    "A new room only works with a relay configured for it.",
-                ));
-                lines.push(note(
-                    "To join someone else's room, choose the first option.",
-                ));
+                lines.push(note("Makes a fresh, empty room on this relay. Nobody else"));
+                lines.push(note("is in it until you send them the key or an invite."));
             } else {
-                lines.push(note("The key looks like rc1-XXXXXXXX-… — whoever runs the"));
-                lines.push(note("room will have sent you one."));
+                lines.push(note(
+                    "The key looks like rc1-XXXXXXXX-… — whoever is already",
+                ));
+                lines.push(note("in the room will have sent you one."));
             }
             lines.push(Line::default());
             lines.push(note("↑↓ to choose · Enter to continue"));
@@ -353,8 +381,11 @@ fn draw_setup(frame: &mut Frame, setup: &Setup) {
             lines.push(note("something you already trust — not the room itself."));
             lines.push(Line::default());
             lines.push(note(
-                "Copy it now. Enter to continue · Backspace to go back.",
+                "You can get it back later with /key, or /invite for a",
             ));
+            lines.push(note("single value carrying the relay details too."));
+            lines.push(Line::default());
+            lines.push(note("Enter to continue · Backspace to go back."));
         }
         Step::EnterKey => {
             lines.push(heading("Paste the room key"));
@@ -371,7 +402,10 @@ fn draw_setup(frame: &mut Frame, setup: &Setup) {
             lines.push(field(&setup.relay, false, inner.width));
             lines.push(Line::default());
             lines.push(note("The relay passes messages along. It can't read them,"));
-            lines.push(note("so it doesn't have to be one you trust."));
+            lines.push(note(
+                "so it needn't be one you trust. One relay carries any",
+            ));
+            lines.push(note("number of rooms."));
         }
         Step::Username => {
             lines.push(heading("Pick a username"));

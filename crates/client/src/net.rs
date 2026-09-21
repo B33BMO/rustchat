@@ -9,7 +9,7 @@ use std::time::Duration;
 use anyhow::{Result, bail};
 use futures_util::{SinkExt, StreamExt};
 use rustchat_core::{
-    ClientMsg, Keys, PROTOCOL_VERSION, Payload, RelayMsg, SealedEnvelope, open, seal,
+    AccessKey, ClientMsg, PROTOCOL_VERSION, Payload, RelayMsg, RoomKeys, SealedEnvelope, open, seal,
 };
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
@@ -61,26 +61,47 @@ enum Outcome {
     Hopeless(String),
 }
 
+/// Everything needed to reach a room: which relay, how to get in, and which
+/// room to join once inside.
+pub struct Connection {
+    pub relay_url: String,
+    pub access: AccessKey,
+    pub room: RoomKeys,
+}
+
+impl std::fmt::Debug for Connection {
+    /// Redacted: this holds the relay access key and the room's message key,
+    /// and connections end up in error messages.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Connection")
+            .field("relay_url", &self.relay_url)
+            .field("access", &"<redacted>")
+            .field("room_id", &hex_prefix(&self.room.room_id))
+            .finish()
+    }
+}
+
+/// First four bytes of a room id, enough to tell two rooms apart in a log
+/// without writing out an identifier that follows a room around.
+fn hex_prefix(bytes: &[u8; 32]) -> String {
+    bytes[..4].iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// Starts the connection task. Returns a command sink and an event source.
-pub fn spawn(relay_url: String, keys: Keys) -> (mpsc::Sender<NetCmd>, mpsc::Receiver<NetEvent>) {
+pub fn spawn(conn: Connection) -> (mpsc::Sender<NetCmd>, mpsc::Receiver<NetEvent>) {
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
     let (ev_tx, ev_rx) = mpsc::channel(256);
     tokio::spawn(async move {
-        run(relay_url, keys, cmd_rx, ev_tx).await;
+        run(conn, cmd_rx, ev_tx).await;
     });
     (cmd_tx, ev_rx)
 }
 
-async fn run(
-    url: String,
-    keys: Keys,
-    mut cmd_rx: mpsc::Receiver<NetCmd>,
-    ev_tx: mpsc::Sender<NetEvent>,
-) {
+async fn run(conn: Connection, mut cmd_rx: mpsc::Receiver<NetCmd>, ev_tx: mpsc::Sender<NetEvent>) {
     let mut backoff = Duration::from_secs(1);
     loop {
         let _ = ev_tx.send(NetEvent::Connecting).await;
-        match session(&url, &keys, &mut cmd_rx, &ev_tx).await {
+        match session(&conn, &mut cmd_rx, &ev_tx).await {
             Ok(Outcome::Quit) => return,
             Ok(Outcome::Hopeless(why)) => {
                 let _ = ev_tx.send(NetEvent::Fatal(why)).await;
@@ -115,12 +136,11 @@ async fn run(
 
 /// Runs one connection from handshake to close.
 async fn session(
-    url: &str,
-    keys: &Keys,
+    conn: &Connection,
     cmd_rx: &mut mpsc::Receiver<NetCmd>,
     ev_tx: &mpsc::Sender<NetEvent>,
 ) -> Result<Outcome> {
-    let (stream, _) = tokio_tungstenite::connect_async(url).await?;
+    let (stream, _) = tokio_tungstenite::connect_async(&conn.relay_url).await?;
     let (mut sink, mut source) = stream.split();
 
     // --- Handshake: prove we know the room key ---------------------------
@@ -137,11 +157,15 @@ async fn session(
         )));
     }
     let challenge = unb64(&nonce)?;
+    // The proof covers relay access; the room id says which room to join. The
+    // room id is a one-way derivation, so naming it here tells the relay where
+    // to route us without telling it anything about what we will say.
     send(
         &mut sink,
         &ClientMsg::Auth {
             v: PROTOCOL_VERSION,
-            proof: b64(&keys.prove(&challenge)),
+            proof: b64(&conn.access.prove(&challenge)),
+            room: to_hex(&conn.room.room_id),
         },
     )
     .await?;
@@ -151,11 +175,11 @@ async fn session(
         .ok_or_else(|| anyhow::anyhow!("relay closed during the handshake"))?;
     let occupants = match welcome {
         RelayMsg::Welcome { occupants } => occupants,
-        // The overwhelmingly likely cause is a wrong room key, so say that
-        // rather than parroting the relay's terser wording.
+        // Auth now covers relay access only, so a rejection means the access
+        // key is wrong — never the room key, which the relay cannot check.
         RelayMsg::Error { reason } => {
             return Ok(Outcome::Hopeless(format!(
-                "the relay turned us away ({reason}) — the room key is probably wrong"
+                "the relay turned us away ({reason}) — the relay access key is probably wrong"
             )));
         }
         other => bail!("unexpected reply to our handshake: {other:?}"),
@@ -174,14 +198,14 @@ async fn session(
                 };
                 match msg {
                     RelayMsg::Msg { env } => {
-                        if let Some(p) = open_envelope(keys, &env) {
+                        if let Some(p) = open_envelope(&conn.room, &env) {
                             let _ = ev_tx.send(NetEvent::Payload(p)).await;
                         }
                     }
                     RelayMsg::History { envs } => {
                         let payloads: Vec<Payload> = envs
                             .iter()
-                            .filter_map(|env| open_envelope(keys, env))
+                            .filter_map(|env| open_envelope(&conn.room, env))
                             .collect();
                         if !payloads.is_empty() {
                             let _ = ev_tx.send(NetEvent::History(payloads)).await;
@@ -205,7 +229,7 @@ async fn session(
             cmd = cmd_rx.recv() => match cmd {
                 Some(NetCmd::Send(payload)) => {
                     let json = serde_json::to_vec(&payload)?;
-                    let (nonce, ciphertext) = seal(&keys.msg, &json)?;
+                    let (nonce, ciphertext) = seal(&conn.room.msg, &json)?;
                     send(&mut sink, &ClientMsg::Send {
                         env: SealedEnvelope { n: b64(&nonce), c: b64(&ciphertext) },
                     }).await?;
@@ -228,11 +252,15 @@ async fn session(
 /// A relay's history can legitimately contain messages from a *previous* room
 /// key — someone rotated it, the relay kept its buffer — so a failure here is
 /// mundane and gets skipped quietly rather than reported as an error.
-fn open_envelope(keys: &Keys, env: &SealedEnvelope) -> Option<Payload> {
+fn open_envelope(room: &RoomKeys, env: &SealedEnvelope) -> Option<Payload> {
     let nonce = unb64(&env.n).ok()?;
     let ciphertext = unb64(&env.c).ok()?;
-    let plaintext = open(&keys.msg, &nonce, &ciphertext).ok()?;
+    let plaintext = open(&room.msg, &nonce, &ciphertext).ok()?;
     serde_json::from_slice(&plaintext).ok()
+}
+
+fn to_hex(bytes: &[u8; 32]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Reads the next relay message, skipping frames that aren't protocol JSON.
@@ -312,6 +340,28 @@ mod tests {
             c: b64(&ct),
         };
         assert!(open_envelope(&mine, &env).is_none());
+    }
+
+    #[test]
+    fn connection_debug_never_leaks_key_material() {
+        let access = rustchat_core::AccessKey::generate();
+        let room = RoomKey::generate();
+        let conn = Connection {
+            relay_url: "wss://relay.example/ws".into(),
+            access: rustchat_core::AccessKey::from_bytes(*access.as_bytes()),
+            room: room.derive(),
+        };
+        let shown = format!("{conn:?}");
+        assert!(shown.contains("<redacted>"));
+        assert!(shown.contains("relay.example"), "the URL is not secret");
+        assert!(
+            !shown.contains(&to_hex(&room.derive().msg)),
+            "the message key leaked into Debug output"
+        );
+        assert!(
+            !shown.contains(&to_hex(&room.derive().room_id)),
+            "the full room id should be abbreviated, not printed whole"
+        );
     }
 
     #[test]
