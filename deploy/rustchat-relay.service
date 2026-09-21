@@ -1,0 +1,49 @@
+[Unit]
+Description=rustchat relay (zero-knowledge chat relay)
+Documentation=https://github.com/B33BMO/rustchat
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# RUSTCHAT_AUTH_KEY lives here rather than on the command line, where it would
+# be visible in `ps` to every user on the box.
+EnvironmentFile=/etc/rustchat-relay.env
+ExecStart=/usr/local/bin/rustchat-relay
+Restart=on-failure
+RestartSec=5s
+
+# The relay keeps its history in memory and reads no files beyond the
+# environment file systemd hands it, so it can be locked down hard.
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+# Binds to loopback only; a tunnel or reverse proxy terminates TLS in front.
+RestrictAddressFamilies=AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @obsolete
+CapabilityBoundingSet=
+UMask=0077
+
+# Keep one busy room from taking the host down with it.
+MemoryMax=256M
+TasksMax=256
+
+[Install]
+WantedBy=multi-user.target
