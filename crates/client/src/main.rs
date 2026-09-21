@@ -61,6 +61,15 @@ struct Cli {
 enum Command {
     /// Generate a room key, and the auth key its relay needs.
     Keygen,
+    /// Print the relay auth key for a room key you already have.
+    ///
+    /// Use this to check whether a relay is configured for the room you think
+    /// it is, or to point a second relay at an existing room.
+    Authkey {
+        /// The room key. Omit it to read from stdin, which keeps the key out
+        /// of your shell history and out of `ps`.
+        room_key: Option<String>,
+    },
     /// Print where the vault lives.
     Where,
     /// Delete the vault. The room itself is unaffected.
@@ -72,6 +81,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Some(Command::Keygen) => keygen(),
+        Some(Command::Authkey { ref room_key }) => authkey(room_key.as_deref()),
         Some(Command::Where) => {
             println!("{}", vault_path(&cli)?.display());
             Ok(())
@@ -114,6 +124,24 @@ fn keygen() -> Result<()> {
     println!();
     println!("The relay only ever needs that second value. It is derived one-way from");
     println!("the room key, so a compromised relay still cannot read any message.");
+    Ok(())
+}
+
+/// Prints the relay auth key derived from an existing room key.
+fn authkey(room_key: Option<&str>) -> Result<()> {
+    let raw = match room_key {
+        Some(key) => key.to_string(),
+        None => {
+            eprint!("Room key: ");
+            let mut line = String::new();
+            std::io::stdin()
+                .read_line(&mut line)
+                .context("reading the room key from stdin")?;
+            line
+        }
+    };
+    let key = RoomKey::parse_or_derive(&raw).context("that is not a usable room key")?;
+    println!("{}", key.derive().auth_hex());
     Ok(())
 }
 
@@ -270,13 +298,23 @@ async fn run(
     Ok(())
 }
 
-/// Awaits the next network event, or blocks forever if there is no connection.
+/// Awaits the next network event, or parks forever if there is no connection.
 ///
-/// Returning `None` eagerly would make `select!` spin at full speed whenever
-/// the client isn't connected, which is most of setup.
+/// Parking matters twice over. Before a connection exists there is no receiver
+/// to poll, and once the network task has exited for good its channel returns
+/// `None` immediately and permanently — so the slot is cleared on the way out.
+/// Without that, this `select!` arm completes instantly on every iteration and
+/// the event loop spins at 100% CPU redrawing forever, which is exactly what
+/// happens after the relay turns a client away.
 async fn recv(rx: &mut Option<tokio::sync::mpsc::Receiver<NetEvent>>) -> Option<NetEvent> {
     match rx.as_mut() {
-        Some(rx) => rx.recv().await,
+        Some(inner) => match inner.recv().await {
+            Some(event) => Some(event),
+            None => {
+                *rx = None;
+                None
+            }
+        },
         None => std::future::pending().await,
     }
 }
@@ -343,7 +381,23 @@ async fn handle_net_event(
         }
         NetEvent::Fatal(why) => {
             app.status = Status::Offline;
+            let key_problem = why.contains("room key");
             app.system(format!("Giving up: {why}"), Level::Bad);
+            // A rejected key is saved in the vault, so relaunching reproduces
+            // this exactly. Without a way out this screen is a dead end.
+            if key_problem && !app.ephemeral {
+                app.system(
+                    "That key is stored in your vault, so relaunching will fail the same \
+                     way. Run `rustchat reset` and rejoin with the key you were given.",
+                    Level::Info,
+                );
+            } else if key_problem {
+                app.system(
+                    "Check the key against the one you were sent — `rustchat authkey <key>` \
+                     prints what the relay would need to accept it.",
+                    Level::Info,
+                );
+            }
         }
     }
 }
@@ -493,6 +547,39 @@ fn decode_room_key(b64: &str) -> Result<RoomKey> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn recv_parks_once_the_network_task_is_gone() {
+        // The bug this guards: a closed channel returns None instantly and
+        // forever, so the select! arm completed every iteration and the event
+        // loop burned 100% CPU after the relay rejected a client.
+        let (tx, rx) = tokio::sync::mpsc::channel::<NetEvent>(1);
+        let mut slot = Some(rx);
+        drop(tx);
+
+        assert!(
+            recv(&mut slot).await.is_none(),
+            "a closed channel yields None once"
+        );
+        assert!(slot.is_none(), "the receiver slot must be cleared");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), recv(&mut slot))
+                .await
+                .is_err(),
+            "recv must park when there is no receiver; returning immediately spins the event loop"
+        );
+    }
+
+    #[tokio::test]
+    async fn recv_parks_before_any_connection_exists() {
+        let mut slot: Option<tokio::sync::mpsc::Receiver<NetEvent>> = None;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), recv(&mut slot))
+                .await
+                .is_err()
+        );
+    }
+
     #[test]
     fn a_tls_backend_is_available() {
         // Guards against the dependency graph losing its rustls backend, which
@@ -508,6 +595,16 @@ mod tests {
     fn installing_the_tls_backend_twice_is_harmless() {
         install_tls_backend();
         install_tls_backend();
+    }
+
+    #[test]
+    fn authkey_matches_what_keygen_prints() {
+        // keygen and authkey must agree, or a relay set up from one and a
+        // client holding the other would never authenticate.
+        let key = RoomKey::generate();
+        let from_keygen = key.derive().auth_hex();
+        let reparsed = RoomKey::decode(&key.encode()).unwrap();
+        assert_eq!(reparsed.derive().auth_hex(), from_keygen);
     }
 
     #[test]

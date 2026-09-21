@@ -297,11 +297,11 @@ fn draw_setup(frame: &mut Frame, setup: &Setup) {
 
     match setup.step {
         Step::Mode => {
-            lines.push(heading("Start a room, or join one"));
+            lines.push(heading("Join a room, or start one"));
             lines.push(Line::default());
             for (i, (label, detail)) in [
-                ("Create a new room", "generates a fresh room key"),
-                ("Join with a key", "paste a key someone sent you"),
+                ("Join a room", "paste the key someone sent you"),
+                ("Create a new room", "generates a brand-new key"),
             ]
             .iter()
             .enumerate()
@@ -318,6 +318,18 @@ fn draw_setup(frame: &mut Frame, setup: &Setup) {
                     Span::styled((*label).to_string(), style),
                     Span::styled(format!("  — {detail}"), Style::default().fg(DIM)),
                 ]));
+            }
+            lines.push(Line::default());
+            if setup.mode_cursor == 1 {
+                lines.push(note(
+                    "A new room only works with a relay configured for it.",
+                ));
+                lines.push(note(
+                    "To join someone else's room, choose the first option.",
+                ));
+            } else {
+                lines.push(note("The key looks like rc1-XXXXXXXX-… — whoever runs the"));
+                lines.push(note("room will have sent you one."));
             }
             lines.push(Line::default());
             lines.push(note("↑↓ to choose · Enter to continue"));
