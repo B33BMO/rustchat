@@ -105,6 +105,20 @@ jobs:
         id: tag
         run: echo "tag=${{ github.event.inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
 
+      # A tag that disagrees with Cargo.toml ships a binary whose --version
+      # misreports which build it is, which is precisely the thing you need to
+      # be able to trust while diagnosing a bad install.
+      - name: Tag must match the crate version
+        run: |
+          set -eu
+          tag="${{ steps.tag.outputs.tag }}"
+          crate=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          echo "tag=$tag crate=$crate"
+          if [ "$tag" != "v$crate" ]; then
+            echo "::error::tag $tag does not match Cargo.toml version $crate" >&2
+            exit 1
+          fi
+
       - name: Publish
         uses: softprops/action-gh-release@v2
         with:
