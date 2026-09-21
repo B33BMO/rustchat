@@ -1,8 +1,10 @@
 //! rustchat — an encrypted TUI chatroom.
 //!
-//! Everyone with the room key is in the room. Messages are sealed on your
+//! Everyone with a room's key is in that room. Messages are sealed on your
 //! machine and opened on theirs; the relay in between only ever handles
-//! ciphertext. See `rustchat-core` for the details.
+//! ciphertext, and is configured with no room keys at all — it routes by a
+//! one-way room id, so one relay carries any number of rooms it cannot read.
+//! See `rustchat-core` for the details.
 
 mod app;
 mod net;
@@ -18,16 +20,17 @@ use crossterm::event::{Event, EventStream, KeyEventKind};
 use futures_util::StreamExt;
 use net::{NetCmd, NetEvent};
 use rustchat_core::vault::{VaultData, open_vault, seal_vault};
-use rustchat_core::{Payload, RoomKey, proto};
+use rustchat_core::{AccessKey, Invite, Payload, RoomKey, proto};
 
 #[derive(Parser, Debug)]
 #[command(
     name = "rustchat",
     version,
     about = "An end-to-end encrypted TUI chatroom.",
-    long_about = "An end-to-end encrypted TUI chatroom.\n\nAnyone holding the room key can \
-                  join and talk. Messages are sealed before they leave your machine, so the \
-                  relay that carries them cannot read them."
+    long_about = "An end-to-end encrypted TUI chatroom.\n\nAnyone holding a room's key can \
+                  join it and talk. Messages are sealed before they leave your machine, so \
+                  the relay that carries them cannot read them. One relay carries any number \
+                  of rooms and is configured for none of them."
 )]
 struct Cli {
     /// Relay to connect to. Overrides the one saved in your vault.
@@ -35,11 +38,21 @@ struct Cli {
     relay: Option<String>,
 
     /// Use this room key for this session only, skipping the vault entirely.
+    /// Requires --access-key too.
     ///
     /// Prefer the `RUSTCHAT_ROOM_KEY` environment variable: an argument is
     /// visible to anyone who can list processes on this machine.
     #[arg(long, env = "RUSTCHAT_ROOM_KEY", hide_env_values = true)]
     room_key: Option<String>,
+
+    /// The relay's access key, which decides who may connect at all.
+    #[arg(long, env = "RUSTCHAT_ACCESS_KEY", hide_env_values = true)]
+    access_key: Option<String>,
+
+    /// Join straight from an invite, skipping the vault. Carries the relay,
+    /// its access key and a room key in one value.
+    #[arg(long, env = "RUSTCHAT_INVITE", hide_env_values = true)]
+    invite: Option<String>,
 
     /// Username for this session. Overrides the saved one.
     #[arg(long, short)]
@@ -59,15 +72,30 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Generate a room key, and the auth key its relay needs.
+    /// Generate a room key to share with the people you want in a room.
     Keygen,
-    /// Print the relay auth key for a room key you already have.
+    /// Generate a relay's access key, and the auth key to configure it with.
     ///
-    /// Use this to check whether a relay is configured for the room you think
-    /// it is, or to point a second relay at an existing room.
+    /// Run this once per relay. Everyone who uses that relay needs the access
+    /// key; it says nothing about which rooms exist or what is in them.
+    Relaykey,
+    /// Print the auth key a relay needs for an access key you already have.
     Authkey {
-        /// The room key. Omit it to read from stdin, which keeps the key out
-        /// of your shell history and out of `ps`.
+        /// The relay access key. Omit it to read from stdin, which keeps the
+        /// key out of your shell history and out of `ps`.
+        access_key: Option<String>,
+    },
+    /// Build a one-paste invite from a relay, its access key and a room key.
+    Invite {
+        /// Relay address, e.g. relay.example.com.
+        #[arg(long, short)]
+        relay: String,
+        /// The relay's access key.
+        #[arg(long, short)]
+        access_key: String,
+        /// The room key. Omit for an invite that grants relay access only,
+        /// letting the holder create or join whichever room they like.
+        #[arg(long, short = 'k')]
         room_key: Option<String>,
     },
     /// Print where the vault lives.
@@ -81,7 +109,13 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Some(Command::Keygen) => keygen(),
-        Some(Command::Authkey { ref room_key }) => authkey(room_key.as_deref()),
+        Some(Command::Relaykey) => relaykey(),
+        Some(Command::Authkey { ref access_key }) => authkey(access_key.as_deref()),
+        Some(Command::Invite {
+            ref relay,
+            ref access_key,
+            ref room_key,
+        }) => make_invite(relay, access_key, room_key.as_deref()),
         Some(Command::Where) => {
             println!("{}", vault_path(&cli)?.display());
             Ok(())
@@ -110,38 +144,85 @@ fn install_tls_backend() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
-/// Prints a fresh room key alongside the auth key to configure a relay with.
+/// Prints a fresh room key.
 fn keygen() -> Result<()> {
     let key = RoomKey::generate();
-    let keys = key.derive();
     println!("Room key   {}", key.encode());
     println!();
-    println!("Give that to anyone you want in the room. It is the only credential,");
-    println!("so treat it like a door key: send it over something you already trust.");
+    println!("Give that to anyone you want in this room. It is what encrypts the");
+    println!("messages, so send it over something you already trust.");
     println!();
-    println!("Relay auth key (for the relay's --auth-key / RUSTCHAT_AUTH_KEY):");
-    println!("  {}", keys.auth_hex());
+    println!("No relay needs configuring for it: the relay routes by a one-way id");
+    println!("derived from this key, and never learns the key itself. The room exists");
+    println!("as soon as somebody joins it.");
     println!();
-    println!("The relay only ever needs that second value. It is derived one-way from");
-    println!("the room key, so a compromised relay still cannot read any message.");
+    println!("People also need the relay's access key. `rustchat invite` bundles both");
+    println!("with the relay address into a single value to paste.");
     Ok(())
 }
 
-/// Prints the relay auth key derived from an existing room key.
-fn authkey(room_key: Option<&str>) -> Result<()> {
-    let raw = match room_key {
+/// Prints a fresh relay access key and the auth key to configure a relay with.
+fn relaykey() -> Result<()> {
+    let key = AccessKey::generate();
+    println!("Relay access key   {}", key.encode());
+    println!();
+    println!("Give this to everyone who should be able to use your relay. It decides");
+    println!("who may connect, and nothing else — it cannot read any room.");
+    println!();
+    println!("Relay auth key (for the relay's --auth-key / RUSTCHAT_AUTH_KEY):");
+    println!("  {}", key.auth_hex());
+    println!();
+    println!("The relay only ever needs that second value, which is derived one-way");
+    println!("from the access key. Configure it with:");
+    println!();
+    println!(
+        "  sudo sh deploy/setup-relay.sh --auth-key {}",
+        key.auth_hex()
+    );
+    Ok(())
+}
+
+/// Prints the relay auth key derived from an existing relay access key.
+fn authkey(access_key: Option<&str>) -> Result<()> {
+    let raw = match access_key {
         Some(key) => key.to_string(),
         None => {
-            eprint!("Room key: ");
+            eprint!("Relay access key: ");
             let mut line = String::new();
             std::io::stdin()
                 .read_line(&mut line)
-                .context("reading the room key from stdin")?;
+                .context("reading the access key from stdin")?;
             line
         }
     };
-    let key = RoomKey::parse_or_derive(&raw).context("that is not a usable room key")?;
-    println!("{}", key.derive().auth_hex());
+    let key = AccessKey::parse_or_derive(&raw).context("that is not a usable access key")?;
+    println!("{}", key.auth_hex());
+    Ok(())
+}
+
+/// Builds a one-paste invite.
+fn make_invite(relay: &str, access_key: &str, room_key: Option<&str>) -> Result<()> {
+    let relay_url = app::normalize_relay(relay).map_err(|e| anyhow::anyhow!(e))?;
+    let access = AccessKey::parse_or_derive(access_key).context("--access-key")?;
+    let room = match room_key {
+        Some(raw) => Some(RoomKey::parse_or_derive(raw).context("--room-key")?),
+        None => None,
+    };
+    let scoped = room.is_some();
+    let invite = Invite {
+        relay_url,
+        access_key: access,
+        room_key: room,
+    };
+    println!("{}", invite.encode());
+    eprintln!();
+    if scoped {
+        eprintln!("That gets someone into this exact room in one paste.");
+    } else {
+        eprintln!("That grants access to the relay, but no particular room — the holder");
+        eprintln!("picks or creates one.");
+    }
+    eprintln!("It contains the keys, so treat it as secret.");
     Ok(())
 }
 
@@ -169,43 +250,51 @@ fn vault_path(cli: &Cli) -> Result<PathBuf> {
 /// Runs the TUI.
 async fn chat(cli: Cli) -> Result<()> {
     let path = vault_path(&cli)?;
-    let vault_exists = path.exists() && !cli.no_vault && cli.room_key.is_none();
+
+    // An explicit invite or room key means "just connect": the vault is
+    // skipped entirely rather than created or consulted.
+    let direct = cli.invite.is_some() || cli.room_key.is_some();
+    let ephemeral = cli.no_vault || direct;
+    let vault_exists = path.exists() && !cli.no_vault && !direct;
     let relay_hint = cli
         .relay
         .clone()
         .unwrap_or_else(|| DEFAULT_RELAY.to_string());
 
-    // An explicit --room-key (or the env var) means "just connect", so the
-    // vault is skipped entirely rather than created or consulted.
-    let ephemeral = cli.no_vault || cli.room_key.is_some();
+    // Resolved before the TUI starts, so a bad key or invite fails on a plain
+    // terminal with a readable message instead of inside the alternate screen.
+    let direct_conn = resolve_direct(&cli, &relay_hint)?;
 
     let screen = if vault_exists {
         Screen::Unlock(Unlock::new())
-    } else if cli.room_key.is_some() {
-        // Nothing left to ask: the key came in on the command line, so setup
-        // is skipped and the session goes straight to the room.
+    } else if direct_conn.is_some() {
         Screen::Chat
     } else {
-        Screen::Setup(Setup::new(
+        Screen::Setup(Box::new(Setup::new(
             app::normalize_relay(&relay_hint).unwrap_or(relay_hint.clone()),
-        ))
+        )))
     };
 
     let mut app = App::new(path, screen, relay_hint.clone(), ephemeral);
 
-    // The direct-key path has no setup or unlock screen to go through, so it
-    // is wired up before the loop starts.
-    let mut pending_keys = None;
-    if let Some(raw) = &cli.room_key {
-        let key = RoomKey::parse_or_derive(raw).context("--room-key / RUSTCHAT_ROOM_KEY")?;
-        app.relay = app::normalize_relay(&relay_hint).map_err(|e| anyhow::anyhow!(e))?;
+    let mut pending = None;
+    if let Some((conn, room_key, access_key)) = direct_conn {
+        app.relay = conn.relay_url.clone();
         app.username = proto::sanitize_username(cli.username.as_deref().unwrap_or("anon"));
-        app.room_key_display = Some(key.encode());
-        pending_keys = Some(key.derive());
+        app.room_key_display = Some(room_key.encode());
+        app.invite_display = Some(
+            Invite {
+                relay_url: conn.relay_url.clone(),
+                access_key,
+                room_key: Some(room_key),
+            }
+            .encode(),
+        );
+        pending = Some(conn);
     }
 
     let mut terminal = ratatui::try_init().context("setting up the terminal")?;
-    let result = run(&mut terminal, &mut app, cli, pending_keys).await;
+    let result = run(&mut terminal, &mut app, cli, pending).await;
     ratatui::restore();
 
     // Persisting after the terminal is restored means a failure here is
@@ -216,18 +305,61 @@ async fn chat(cli: Cli) -> Result<()> {
     result
 }
 
+/// A connection resolved from the command line, with the keys kept alongside
+/// so the caller can display them; [`net::Connection`] consumes what it needs.
+type Direct = (net::Connection, RoomKey, AccessKey);
+
+/// Turns `--invite`, or `--room-key` plus `--access-key`, into a connection.
+fn resolve_direct(cli: &Cli, relay_hint: &str) -> Result<Option<Direct>> {
+    if let Some(raw) = &cli.invite {
+        let invite = Invite::decode(raw).context("--invite / RUSTCHAT_INVITE")?;
+        let room = invite
+            .room_key
+            .context("that invite carries no room key, so there is no room to join")?;
+        // An explicit --relay still wins, so one invite can be pointed at a
+        // different address for the same relay.
+        let relay_url = match &cli.relay {
+            Some(relay) => app::normalize_relay(relay).map_err(|e| anyhow::anyhow!(e))?,
+            None => app::normalize_relay(&invite.relay_url).map_err(|e| anyhow::anyhow!(e))?,
+        };
+        let conn = net::Connection {
+            relay_url,
+            access: AccessKey::from_bytes(*invite.access_key.as_bytes()),
+            room: room.derive(),
+        };
+        return Ok(Some((conn, room, invite.access_key)));
+    }
+
+    let Some(raw_room) = &cli.room_key else {
+        return Ok(None);
+    };
+    let access_raw = cli.access_key.as_deref().context(
+        "--room-key needs --access-key too (the relay's access key). \
+         `rustchat invite` bundles both into a single value to paste.",
+    )?;
+    let room = RoomKey::parse_or_derive(raw_room).context("--room-key / RUSTCHAT_ROOM_KEY")?;
+    let access =
+        AccessKey::parse_or_derive(access_raw).context("--access-key / RUSTCHAT_ACCESS_KEY")?;
+    let conn = net::Connection {
+        relay_url: app::normalize_relay(relay_hint).map_err(|e| anyhow::anyhow!(e))?,
+        access: AccessKey::from_bytes(*access.as_bytes()),
+        room: room.derive(),
+    };
+    Ok(Some((conn, room, access)))
+}
+
 async fn run(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
     cli: Cli,
-    pending_keys: Option<rustchat_core::Keys>,
+    pending: Option<net::Connection>,
 ) -> Result<()> {
     let mut events = EventStream::new();
     let mut net_tx: Option<tokio::sync::mpsc::Sender<NetCmd>> = None;
     let mut net_rx: Option<tokio::sync::mpsc::Receiver<NetEvent>> = None;
 
-    if let Some(keys) = pending_keys {
-        let (tx, rx) = net::spawn(app.relay.clone(), keys);
+    if let Some(conn) = pending {
+        let (tx, rx) = net::spawn(conn);
         net_tx = Some(tx);
         net_rx = Some(rx);
         app.status = Status::Connecting;
@@ -441,6 +573,20 @@ async fn do_unlock(
     };
 
     let key = decode_room_key(&data.room_key_b64)?;
+    // A vault from before relay access keys existed cannot connect, and no
+    // amount of retrying the passphrase will change that — say so plainly.
+    if data.access_key_b64.is_empty() {
+        let Screen::Unlock(unlock) = &mut app.screen else {
+            return Ok(());
+        };
+        unlock.busy = false;
+        unlock.passphrase.clear();
+        unlock.error = Some(
+            "This vault predates relay access keys. Run `rustchat reset` and set up again.".into(),
+        );
+        return Ok(());
+    }
+    let access = decode_access_key(&data.access_key_b64)?;
     app.passphrase = passphrase;
     app.username = proto::sanitize_username(cli.username.as_deref().unwrap_or(
         if data.username.is_empty() {
@@ -456,11 +602,23 @@ async fn do_unlock(
         None => app::normalize_relay(DEFAULT_RELAY).map_err(|e| anyhow::anyhow!(e))?,
     };
     app.room_key_display = Some(key.encode());
+    app.invite_display = Some(
+        Invite {
+            relay_url: app.relay.clone(),
+            access_key: AccessKey::from_bytes(*access.as_bytes()),
+            room_key: Some(RoomKey::from_bytes(*key.as_bytes())),
+        }
+        .encode(),
+    );
     app.vault = data;
     app.screen = Screen::Chat;
     app.load_history();
 
-    let (tx, rx) = net::spawn(app.relay.clone(), key.derive());
+    let (tx, rx) = net::spawn(net::Connection {
+        relay_url: app.relay.clone(),
+        access,
+        room: key.derive(),
+    });
     *net_tx = Some(tx);
     *net_rx = Some(rx);
     app.status = Status::Connecting;
@@ -484,16 +642,32 @@ async fn do_finish_setup(
         setup.error = Some("No room key — go back and set one.".into());
         return Ok(());
     };
+    let Some(access_key) = setup.access_key.as_ref() else {
+        setup.busy = false;
+        setup.error = Some("No relay access key — go back and set one.".into());
+        return Ok(());
+    };
 
     let passphrase = setup.passphrase.clone();
     let data = VaultData {
-        room_key_b64: encode_room_key(room_key),
+        room_key_b64: encode_b64(room_key.as_bytes()),
+        access_key_b64: encode_b64(access_key.as_bytes()),
         relay_url: setup.relay.clone(),
         username: setup.username.clone(),
         history: Vec::new(),
     };
-    let keys = room_key.derive();
+    let conn = net::Connection {
+        relay_url: setup.relay.clone(),
+        access: AccessKey::from_bytes(*access_key.as_bytes()),
+        room: room_key.derive(),
+    };
     let key_display = room_key.encode();
+    let invite_display = Invite {
+        relay_url: setup.relay.clone(),
+        access_key: AccessKey::from_bytes(*access_key.as_bytes()),
+        room_key: Some(RoomKey::from_bytes(*room_key.as_bytes())),
+    }
+    .encode();
     let relay = setup.relay.clone();
     let username = setup.username.clone();
 
@@ -512,6 +686,7 @@ async fn do_finish_setup(
     app.username = username;
     app.relay = relay;
     app.room_key_display = Some(key_display);
+    app.invite_display = Some(invite_display);
     app.screen = Screen::Chat;
     if !app.ephemeral {
         app.system(
@@ -520,27 +695,33 @@ async fn do_finish_setup(
         );
     }
 
-    let (tx, rx) = net::spawn(app.relay.clone(), keys);
+    let (tx, rx) = net::spawn(conn);
     *net_tx = Some(tx);
     *net_rx = Some(rx);
     app.status = Status::Connecting;
     Ok(())
 }
 
-fn encode_room_key(key: &RoomKey) -> String {
+fn encode_b64(bytes: &[u8; 32]) -> String {
     use base64::Engine;
-    base64::engine::general_purpose::STANDARD.encode(key.as_bytes())
+    base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
-fn decode_room_key(b64: &str) -> Result<RoomKey> {
+fn decode_b64(b64: &str, what: &str) -> Result<[u8; 32]> {
     use base64::Engine;
     let raw = base64::engine::general_purpose::STANDARD
         .decode(b64)
-        .context("the vault's room key is malformed")?;
-    let bytes: [u8; 32] = raw
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("the vault's room key is the wrong length"))?;
-    Ok(RoomKey::from_bytes(bytes))
+        .with_context(|| format!("the vault's {what} is malformed"))?;
+    raw.try_into()
+        .map_err(|_| anyhow::anyhow!("the vault's {what} is the wrong length"))
+}
+
+fn decode_room_key(b64: &str) -> Result<RoomKey> {
+    Ok(RoomKey::from_bytes(decode_b64(b64, "room key")?))
+}
+
+fn decode_access_key(b64: &str) -> Result<AccessKey> {
+    Ok(AccessKey::from_bytes(decode_b64(b64, "access key")?))
 }
 
 #[cfg(test)]
@@ -598,19 +779,119 @@ mod tests {
     }
 
     #[test]
-    fn authkey_matches_what_keygen_prints() {
-        // keygen and authkey must agree, or a relay set up from one and a
-        // client holding the other would never authenticate.
-        let key = RoomKey::generate();
-        let from_keygen = key.derive().auth_hex();
-        let reparsed = RoomKey::decode(&key.encode()).unwrap();
-        assert_eq!(reparsed.derive().auth_hex(), from_keygen);
+    fn relaykey_and_authkey_agree() {
+        // `relaykey` prints an access key plus the auth key to configure a
+        // relay with; `authkey` re-derives it from the access key later. If
+        // they ever disagreed, a relay set up from one would reject clients
+        // holding the other.
+        let key = AccessKey::generate();
+        let printed = key.auth_hex();
+        let reparsed = AccessKey::decode(&key.encode()).unwrap();
+        assert_eq!(reparsed.auth_hex(), printed);
+    }
+
+    #[test]
+    fn a_room_key_is_not_accepted_as_an_access_key() {
+        // The two are pasted into adjacent prompts, so mixing them up must
+        // fail loudly rather than silently deriving a key from the wrong one.
+        let room = RoomKey::generate();
+        assert!(AccessKey::decode(&room.encode()).is_err());
+    }
+
+    #[test]
+    fn a_direct_room_key_without_an_access_key_is_refused() {
+        // Otherwise the failure would surface as a confusing relay rejection.
+        let cli = Cli {
+            relay: None,
+            room_key: Some(RoomKey::generate().encode()),
+            access_key: None,
+            invite: None,
+            username: None,
+            no_vault: true,
+            vault: None,
+            command: None,
+        };
+        let err = resolve_direct(&cli, DEFAULT_RELAY).unwrap_err().to_string();
+        assert!(err.contains("--access-key"), "got: {err}");
+    }
+
+    #[test]
+    fn an_invite_resolves_to_a_connection() {
+        let access = AccessKey::generate();
+        let room = RoomKey::generate();
+        let token = Invite {
+            relay_url: "wss://relay.example.com/ws".into(),
+            access_key: AccessKey::from_bytes(*access.as_bytes()),
+            room_key: Some(RoomKey::from_bytes(*room.as_bytes())),
+        }
+        .encode();
+        let cli = Cli {
+            relay: None,
+            room_key: None,
+            access_key: None,
+            invite: Some(token),
+            username: None,
+            no_vault: true,
+            vault: None,
+            command: None,
+        };
+        let (conn, room_back, access_back) = resolve_direct(&cli, DEFAULT_RELAY).unwrap().unwrap();
+        assert_eq!(conn.relay_url, "wss://relay.example.com/ws");
+        assert_eq!(room_back.as_bytes(), room.as_bytes());
+        assert_eq!(access_back.as_bytes(), access.as_bytes());
+        assert_eq!(conn.room.room_id, room.derive().room_id);
+    }
+
+    #[test]
+    fn an_explicit_relay_overrides_the_invites() {
+        let token = Invite {
+            relay_url: "wss://from-invite.example/ws".into(),
+            access_key: AccessKey::generate(),
+            room_key: Some(RoomKey::generate()),
+        }
+        .encode();
+        let cli = Cli {
+            relay: Some("override.example".into()),
+            room_key: None,
+            access_key: None,
+            invite: Some(token),
+            username: None,
+            no_vault: true,
+            vault: None,
+            command: None,
+        };
+        let (conn, _, _) = resolve_direct(&cli, DEFAULT_RELAY).unwrap().unwrap();
+        assert_eq!(conn.relay_url, "wss://override.example/ws");
+    }
+
+    #[test]
+    fn an_invite_without_a_room_is_refused_for_a_direct_join() {
+        // Relay-access-only invites are valid, but there is no room to enter,
+        // so the wizard has to ask — a direct join cannot.
+        let token = Invite {
+            relay_url: "wss://relay.example/ws".into(),
+            access_key: AccessKey::generate(),
+            room_key: None,
+        }
+        .encode();
+        let cli = Cli {
+            relay: None,
+            room_key: None,
+            access_key: None,
+            invite: Some(token),
+            username: None,
+            no_vault: true,
+            vault: None,
+            command: None,
+        };
+        let err = resolve_direct(&cli, DEFAULT_RELAY).unwrap_err().to_string();
+        assert!(err.contains("no room key"), "got: {err}");
     }
 
     #[test]
     fn room_keys_survive_the_vault_encoding() {
         let key = RoomKey::generate();
-        let back = decode_room_key(&encode_room_key(&key)).unwrap();
+        let back = decode_room_key(&encode_b64(key.as_bytes())).unwrap();
         assert_eq!(key.as_bytes(), back.as_bytes());
     }
 

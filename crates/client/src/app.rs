@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use rustchat_core::vault::{StoredLine, VaultData};
-use rustchat_core::{Payload, RoomKey, proto};
+use rustchat_core::{AccessKey, Invite, Payload, RoomKey, proto};
 
 /// Default relay, overridable at setup or with `--relay`.
 pub const DEFAULT_RELAY: &str = "wss://relay.bmo.guru/ws";
@@ -53,8 +53,9 @@ pub enum Status {
 
 /// Which screen is in front of the user.
 pub enum Screen {
-    /// First run: no vault yet.
-    Setup(Setup),
+    /// First run: no vault yet. Boxed because it is far larger than the other
+    /// variants, and `Screen` is moved around as one value.
+    Setup(Box<Setup>),
     /// A vault exists; it needs a passphrase.
     Unlock(Unlock),
     Chat,
@@ -62,12 +63,17 @@ pub enum Screen {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
+    /// One paste that carries the relay, its access key and a room key.
+    /// Leaving it blank falls through to entering each part by hand.
+    Invite,
+    Relay,
+    /// The relay's access key — who may connect at all.
+    Access,
     /// Create a new room or join an existing one.
     Mode,
-    /// Showing a freshly generated key, so it can be written down.
-    ShowKey,
     EnterKey,
-    Relay,
+    /// Showing a freshly generated key, so it can be handed out.
+    ShowKey,
     Username,
     Passphrase,
     Confirm,
@@ -79,6 +85,10 @@ pub struct Setup {
     pub mode_cursor: usize,
     /// Set once a key is generated or successfully parsed.
     pub room_key: Option<RoomKey>,
+    /// Set from an invite, or parsed from [`Setup::access_input`].
+    pub access_key: Option<AccessKey>,
+    pub invite_input: String,
+    pub access_input: String,
     pub key_input: String,
     pub relay: String,
     pub username: String,
@@ -86,14 +96,20 @@ pub struct Setup {
     pub confirm: String,
     pub error: Option<String>,
     pub busy: bool,
+    /// True when the relay and keys came from an invite, so the UI can say so
+    /// rather than showing fields the person never filled in.
+    pub from_invite: bool,
 }
 
 impl Setup {
     pub fn new(relay: String) -> Self {
         Self {
-            step: Step::Mode,
+            step: Step::Invite,
             mode_cursor: 0,
             room_key: None,
+            access_key: None,
+            invite_input: String::new(),
+            access_input: String::new(),
             key_input: String::new(),
             relay,
             username: String::new(),
@@ -101,12 +117,15 @@ impl Setup {
             confirm: String::new(),
             error: None,
             busy: false,
+            from_invite: false,
         }
     }
 
     /// The field the current step is editing, if it edits one.
     fn field_mut(&mut self) -> Option<&mut String> {
         match self.step {
+            Step::Invite => Some(&mut self.invite_input),
+            Step::Access => Some(&mut self.access_input),
             Step::EnterKey => Some(&mut self.key_input),
             Step::Relay => Some(&mut self.relay),
             Step::Username => Some(&mut self.username),
@@ -168,6 +187,8 @@ pub struct App {
     /// Held so the vault can be re-sealed on exit. Zeroed when `App` drops.
     pub passphrase: String,
     pub room_key_display: Option<String>,
+    /// Kept so `/invite` can mint a one-paste invite for someone else.
+    pub invite_display: Option<String>,
     /// True when `--no-vault` was passed: nothing is written to disk.
     pub ephemeral: bool,
     pub should_quit: bool,
@@ -189,6 +210,7 @@ impl App {
             vault: VaultData::default(),
             passphrase: String::new(),
             room_key_display: None,
+            invite_display: None,
             ephemeral,
             should_quit: false,
         }
@@ -350,6 +372,8 @@ impl App {
                 if let Some(field) = setup.field_mut() {
                     field.pop();
                 } else if setup.step == Step::ShowKey {
+                    // Going back discards the generated key; a fresh one is
+                    // made if they choose to create again.
                     setup.step = Step::Mode;
                     setup.room_key = None;
                 }
@@ -367,12 +391,57 @@ impl App {
 
         // Enter: validate the current step and move on.
         match setup.step {
+            Step::Invite => {
+                let raw = setup.invite_input.trim().to_string();
+                if raw.is_empty() {
+                    // Nothing pasted: fall through to entering each part by
+                    // hand, which is what the relay's operator does.
+                    setup.step = Step::Relay;
+                } else {
+                    match Invite::decode(&raw) {
+                        Ok(inv) => match normalize_relay(&inv.relay_url) {
+                            Ok(url) => {
+                                setup.relay = url;
+                                setup.access_key = Some(inv.access_key);
+                                setup.from_invite = true;
+                                // An invite may carry a room or just relay
+                                // access, so only skip ahead if it had a room.
+                                match inv.room_key {
+                                    Some(room) => {
+                                        setup.room_key = Some(room);
+                                        setup.step = Step::Username;
+                                    }
+                                    None => setup.step = Step::Mode,
+                                }
+                            }
+                            Err(err) => {
+                                setup.error =
+                                    Some(format!("that invite's relay looks wrong: {err}"))
+                            }
+                        },
+                        Err(err) => setup.error = Some(format!("{err:#}")),
+                    }
+                }
+            }
+            Step::Relay => match normalize_relay(&setup.relay) {
+                Ok(url) => {
+                    setup.relay = url;
+                    setup.step = Step::Access;
+                }
+                Err(err) => setup.error = Some(err),
+            },
+            Step::Access => match AccessKey::parse_or_derive(&setup.access_input) {
+                Ok(key) => {
+                    setup.access_key = Some(key);
+                    setup.step = Step::Mode;
+                }
+                Err(err) => setup.error = Some(format!("{err:#}")),
+            },
             Step::Mode => {
                 // Joining is first and default: most people arrive holding a
-                // key somebody sent them. Creating a room generates a *new*
-                // key, which silently will not match a relay configured for a
-                // different room — so it must be chosen deliberately, never
-                // landed on by pressing Enter.
+                // key somebody sent them. Creating a room is now a real option
+                // — the relay carries any number of rooms — but it still means
+                // nobody else is there until you hand the key out.
                 if setup.mode_cursor == 0 {
                     setup.step = Step::EnterKey;
                 } else {
@@ -380,20 +449,13 @@ impl App {
                     setup.step = Step::ShowKey;
                 }
             }
-            Step::ShowKey => setup.step = Step::Relay,
+            Step::ShowKey => setup.step = Step::Username,
             Step::EnterKey => match RoomKey::parse_or_derive(&setup.key_input) {
                 Ok(key) => {
                     setup.room_key = Some(key);
-                    setup.step = Step::Relay;
-                }
-                Err(err) => setup.error = Some(format!("{err:#}")),
-            },
-            Step::Relay => match normalize_relay(&setup.relay) {
-                Ok(url) => {
-                    setup.relay = url;
                     setup.step = Step::Username;
                 }
-                Err(err) => setup.error = Some(err),
+                Err(err) => setup.error = Some(format!("{err:#}")),
             },
             Step::Username => {
                 let name = proto::sanitize_username(&setup.username);
@@ -511,8 +573,9 @@ impl App {
             }
             "help" | "h" | "?" => {
                 self.system(
-                    "/key show the room key · /nick <name> rename · /who occupancy \
-                     · /clear wipe the view · /forget erase saved history · /quit",
+                    "/invite one-paste invite · /key show the room key · /nick <name> rename \
+                     · /who occupancy · /clear wipe the view · /forget erase saved history \
+                     · /quit",
                     Level::Info,
                 );
                 Action::None
@@ -524,8 +587,27 @@ impl App {
                             format!("Room key: {key}  (anyone with this can read the room)"),
                             Level::Warn,
                         );
+                        self.system(
+                            "They also need this relay's access key — or use /invite, which \
+                             bundles both with the relay address.",
+                            Level::Info,
+                        );
                     }
                     None => self.system("Room key unavailable.", Level::Bad),
+                }
+                Action::None
+            }
+            "invite" => {
+                match self.invite_display.clone() {
+                    Some(invite) => {
+                        self.system(format!("Invite: {invite}"), Level::Warn);
+                        self.system(
+                            "One paste gets someone into this exact room. It contains both \
+                             keys, so treat it like the room key itself.",
+                            Level::Info,
+                        );
+                    }
+                    None => self.system("Invite unavailable.", Level::Bad),
                 }
                 Action::None
             }
@@ -593,6 +675,7 @@ impl Drop for App {
         use zeroize::Zeroize;
         self.passphrase.zeroize();
         self.vault.room_key_b64.zeroize();
+        self.vault.access_key_b64.zeroize();
     }
 }
 
@@ -786,7 +869,7 @@ mod tests {
         for screen in [
             Screen::Chat,
             Screen::Unlock(Unlock::new()),
-            Screen::Setup(Setup::new("x".into())),
+            Screen::Setup(Box::new(Setup::new("x".into()))),
         ] {
             let mut app = App::new(PathBuf::from("/tmp/nope"), screen, "x".into(), true);
             let action = app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
@@ -824,7 +907,7 @@ mod tests {
     fn setup_rejects_a_mismatched_passphrase() {
         let mut app = App::new(
             PathBuf::from("/tmp/nope"),
-            Screen::Setup(Setup::new("x".into())),
+            Screen::Setup(Box::new(Setup::new("x".into()))),
             "x".into(),
             true,
         );
@@ -849,7 +932,7 @@ mod tests {
     fn setup_requires_a_long_enough_passphrase() {
         let mut app = App::new(
             PathBuf::from("/tmp/nope"),
-            Screen::Setup(Setup::new("x".into())),
+            Screen::Setup(Box::new(Setup::new("x".into()))),
             "x".into(),
             true,
         );

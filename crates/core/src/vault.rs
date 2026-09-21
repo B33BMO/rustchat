@@ -45,6 +45,11 @@ pub struct VaultData {
     /// Base64 of the 32-byte room key.
     #[serde(default)]
     pub room_key_b64: String,
+    /// Base64 of the 32-byte relay access key. Defaulted rather than required
+    /// so a vault written by an older build still decrypts — it will simply
+    /// have no access key, which the client reports as needing setup again.
+    #[serde(default)]
+    pub access_key_b64: String,
     #[serde(default)]
     pub relay_url: String,
     #[serde(default)]
@@ -175,6 +180,7 @@ mod tests {
     fn sample() -> VaultData {
         VaultData {
             room_key_b64: "aaaa".into(),
+            access_key_b64: "bbbb".into(),
             relay_url: "wss://relay.example/ws".into(),
             username: "bmo".into(),
             history: vec![StoredLine {

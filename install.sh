@@ -228,9 +228,11 @@ finish() {
     esac
     say ""
     if [ -n "$WANT_RELAY" ]; then
-        say "To host a room:"
-        note "rustchat keygen              # prints a room key + the relay's auth key"
+        say "To run a relay:"
+        note "rustchat relaykey            # prints an access key + the relay's auth key"
         note "rustchat-relay --auth-key <auth key from above>"
+        say ""
+        say "It carries any number of rooms; no per-room configuration."
         say ""
     fi
 }

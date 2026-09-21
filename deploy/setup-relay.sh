@@ -4,9 +4,10 @@
 #   sudo sh deploy/setup-relay.sh --auth-key <64 hex chars> [--port 7777]
 #
 # The relay binds loopback only and speaks plain HTTP: put Cloudflare Tunnel,
-# nginx or Caddy in front of it to terminate TLS. It is given the room's *auth*
-# key, which lets it turn away clients that don't know the room key while
-# leaving it unable to read any message.
+# nginx or Caddy in front of it to terminate TLS. It is given the relay's
+# *access* auth key, which lets it turn away clients that don't hold the access
+# key. It is given no room keys at all, so it carries any number of rooms while
+# being unable to read a single message in any of them.
 
 set -eu
 
@@ -35,7 +36,7 @@ while [ $# -gt 0 ]; do
 done
 
 [ "$(id -u)" = "0" ] || die "run this with sudo"
-[ -n "$AUTH_KEY" ] || die "pass --auth-key (get one from 'rustchat keygen')"
+[ -n "$AUTH_KEY" ] || die "pass --auth-key (get one from 'rustchat relaykey')"
 
 # Validate before touching anything, so a typo doesn't leave a broken unit.
 case "$AUTH_KEY" in
@@ -88,12 +89,14 @@ umask 077
 cat > "$ENV_FILE" <<EOF
 # rustchat relay configuration. Managed by deploy/setup-relay.sh.
 #
-# This is the room's AUTH key, not the room key. It lets the relay reject
-# clients that don't know the room key, and cannot be used to read messages.
+# This is the relay's ACCESS auth key. It decides who may connect. It is not a
+# room key, and no room key is stored here: the relay routes rooms by a one-way
+# id and cannot read any of them.
 RUSTCHAT_AUTH_KEY=$AUTH_KEY
 RUSTCHAT_BIND=127.0.0.1:$PORT
 RUSTCHAT_HISTORY=$HISTORY
 RUSTCHAT_MAX_CONNS=200
+RUSTCHAT_MAX_ROOMS=64
 EOF
 chmod 600 "$ENV_FILE"
 
@@ -132,9 +135,15 @@ then create the DNS route and restart the tunnel:
   cloudflared tunnel route dns <tunnel> <your.hostname>
   sudo systemctl restart cloudflared
 
-Clients then connect with:
+Then hand people an invite, which bundles the relay address with the access
+key and a room key into one value to paste. On any machine with rustchat:
 
-  rustchat --relay wss://<your.hostname>/ws
+  rustchat keygen                       (prints a room key)
+  rustchat invite --relay <your.hostname> --access-key <access key> \
+                  --room-key <that room key>
+
+Anyone can also just run rustchat and enter the parts by hand. Any number of
+rooms work on this relay without configuring it again.
 
 Logs:    journalctl -u rustchat-relay -f
 Restart: sudo systemctl restart rustchat-relay
