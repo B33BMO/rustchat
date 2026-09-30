@@ -228,6 +228,14 @@ async fn session(
 
             cmd = cmd_rx.recv() => match cmd {
                 Some(NetCmd::Send(payload)) => {
+                    // The UI checks first; this is the backstop, because the
+                    // relay's answer to an over-size envelope is silence.
+                    if !rustchat_core::proto::fits(&payload) {
+                        let _ = ev_tx
+                            .send(NetEvent::Notice("That was too long to send; it didn't go out.".into()))
+                            .await;
+                        continue;
+                    }
                     let json = serde_json::to_vec(&payload)?;
                     let (nonce, ciphertext) = seal(&conn.room.msg, &json)?;
                     send(&mut sink, &ClientMsg::Send {

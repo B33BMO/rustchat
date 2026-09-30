@@ -16,6 +16,9 @@ const AAD: &[u8] = b"rustchat-v1-payload";
 /// Nonce width for XChaCha20-Poly1305, in bytes.
 pub const NONCE_BYTES: usize = 24;
 
+/// Poly1305 tag appended to every ciphertext, in bytes.
+pub const TAG_BYTES: usize = 16;
+
 /// Encrypts `plaintext` under `msg_key`, returning `(nonce, ciphertext)`.
 pub fn seal(msg_key: &[u8; 32], plaintext: &[u8]) -> Result<([u8; NONCE_BYTES], Vec<u8>)> {
     let cipher = XChaCha20Poly1305::new(msg_key.into());
