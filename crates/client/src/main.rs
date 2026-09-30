@@ -301,7 +301,11 @@ async fn chat(cli: Cli) -> Result<()> {
     }
 
     let mut terminal = ratatui::try_init().context("setting up the terminal")?;
+    // Focus reports are what let a mention notify only when you're elsewhere.
+    // A terminal that doesn't support them just never sends any.
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableFocusChange);
     let result = run(&mut terminal, &mut app, cli, pending).await;
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableFocusChange);
     ratatui::restore();
 
     // Persisting after the terminal is restored means a failure here is
@@ -385,6 +389,8 @@ async fn run(
         let action = tokio::select! {
             input = events.next() => match input {
                 Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => app.on_key(key),
+                Some(Ok(Event::FocusGained)) => { app.focused = Some(true); Action::None }
+                Some(Ok(Event::FocusLost)) => { app.focused = Some(false); Action::None }
                 // A resize or a paste just needs the redraw at the top of the
                 // loop; anything else we ignore.
                 Some(Ok(_)) => Action::None,
@@ -403,6 +409,10 @@ async fn run(
 
             _ = tick.tick() => Action::None,
         };
+
+        if let Some(text) = app.alert.take() {
+            ring(&text);
+        }
 
         match action {
             Action::None => {}
@@ -435,6 +445,28 @@ async fn run(
         }
     }
     Ok(())
+}
+
+/// Rings the terminal bell and asks the terminal for a desktop notification.
+///
+/// OSC 9 is understood by iTerm2, WezTerm, Ghostty, kitty and Windows
+/// Terminal, and silently ignored elsewhere, where the bell still works.
+/// Under tmux it has to be wrapped to pass through, which also needs
+/// `set -g allow-passthrough on`.
+fn ring(text: &str) {
+    use std::io::Write;
+    // Control characters would end the escape sequence early. Names are
+    // sanitised already; this is belt and braces.
+    let text: String = text.chars().filter(|c| !c.is_control()).collect();
+    let osc = format!("\x1b]9;rustchat: {text}\x07");
+    let osc = if std::env::var_os("TMUX").is_some() {
+        format!("\x1bPtmux;{}\x1b\\", osc.replace('\x1b', "\x1b\x1b"))
+    } else {
+        osc
+    };
+    let mut out = std::io::stdout();
+    let _ = write!(out, "\x07{osc}");
+    let _ = out.flush();
 }
 
 /// Awaits the next network event, or parks forever if there is no connection.
@@ -603,6 +635,7 @@ async fn do_unlock(
         }
         .encode(),
     );
+    app.notify = app::Notify::parse(&data.notify).unwrap_or(app::Notify::Mentions);
     app.vault = data;
     app.screen = Screen::Chat;
     app.load_history();
@@ -648,6 +681,7 @@ async fn do_finish_setup(
         relay_url: setup.relay.clone(),
         username: setup.username.clone(),
         history: Vec::new(),
+        notify: String::new(),
     };
     let conn = net::Connection {
         relay_url: setup.relay.clone(),

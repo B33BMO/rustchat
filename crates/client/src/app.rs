@@ -22,6 +22,8 @@ pub enum Entry {
         /// room member can put any name on a message, so this is a display
         /// nicety, not a claim about who sent what.
         own: bool,
+        /// Addresses you by `@name`, so the UI can make it stand out.
+        mention: bool,
     },
     Presence {
         user: String,
@@ -41,6 +43,35 @@ pub enum Level {
     Good,
     Warn,
     Bad,
+}
+
+/// Which incoming messages ring the bell and raise a desktop notification
+/// while the terminal isn't focused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Notify {
+    /// Only messages that say `@you`.
+    Mentions,
+    All,
+    Off,
+}
+
+impl Notify {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "mentions" | "mention" | "" => Some(Self::Mentions),
+            "all" => Some(Self::All),
+            "off" | "none" => Some(Self::Off),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Mentions => "mentions",
+            Self::All => "all",
+            Self::Off => "off",
+        }
+    }
 }
 
 /// Connection state, as far as the UI is concerned.
@@ -193,6 +224,14 @@ pub struct App {
     /// True when `--no-vault` was passed: nothing is written to disk.
     pub ephemeral: bool,
     pub should_quit: bool,
+    pub notify: Notify,
+    /// Whether the terminal has focus. `None` until the terminal says, and
+    /// forever in one that never reports focus — treated as unfocused, since
+    /// an unwanted bell beats a missed mention.
+    pub focused: Option<bool>,
+    /// A notification waiting to be written to the terminal. Taken by the
+    /// event loop, which owns stdout; the app only decides one is due.
+    pub alert: Option<String>,
 }
 
 impl App {
@@ -214,6 +253,46 @@ impl App {
             invite_display: None,
             ephemeral,
             should_quit: false,
+            notify: Notify::Mentions,
+            focused: None,
+            alert: None,
+        }
+    }
+
+    /// Adds a chat line to the transcript, working out how to mark it.
+    fn push_msg(&mut self, user: String, body: String, ts: i64) {
+        let own = user == self.username;
+        let mention = !own && mentions(&body, &self.username);
+        self.entries.push(Entry::Msg {
+            user,
+            body,
+            ts,
+            own,
+            mention,
+        });
+    }
+
+    /// Decides whether a message that just arrived live deserves a
+    /// notification. Never for replayed history, never for your own lines.
+    fn maybe_alert(&mut self, user: &str, body: &str) {
+        if user == self.username || self.focused == Some(true) {
+            return;
+        }
+        let mention = mentions(body, &self.username);
+        let due = match self.notify {
+            Notify::Off => false,
+            Notify::Mentions => mention,
+            Notify::All => true,
+        };
+        if due {
+            // The body is left out on purpose: a notification lands in the
+            // OS notification centre and on the lock screen, which is exactly
+            // where an end-to-end encrypted message shouldn't be sitting.
+            self.alert = Some(if mention {
+                format!("{user} mentioned you")
+            } else {
+                format!("new message from {user}")
+            });
         }
     }
 
@@ -229,20 +308,17 @@ impl App {
     pub fn absorb(&mut self, payload: Payload, from_history: bool) {
         match payload {
             Payload::Msg { user, body, ts } => {
-                let own = user == self.username;
-                if !from_history && !self.ephemeral {
-                    self.vault.push_line(StoredLine {
-                        user: user.clone(),
-                        body: body.clone(),
-                        ts,
-                    });
+                if !from_history {
+                    self.maybe_alert(&user, &body);
+                    if !self.ephemeral {
+                        self.vault.push_line(StoredLine {
+                            user: user.clone(),
+                            body: body.clone(),
+                            ts,
+                        });
+                    }
                 }
-                self.entries.push(Entry::Msg {
-                    user,
-                    body,
-                    ts,
-                    own,
-                });
+                self.push_msg(user, body, ts);
             }
             // Presence is noise in a replayed backlog: "bmo joined" from two
             // hours ago tells you nothing about who is here now. Your own
@@ -319,13 +395,7 @@ impl App {
                     ts,
                 });
             }
-            let own = user == self.username;
-            self.entries.push(Entry::Msg {
-                user,
-                body,
-                ts,
-                own,
-            });
+            self.push_msg(user, body, ts);
         }
         self.trim();
     }
@@ -352,13 +422,7 @@ impl App {
             Level::Info,
         );
         for line in lines {
-            let own = line.user == self.username;
-            self.entries.push(Entry::Msg {
-                user: line.user,
-                body: line.body,
-                ts: line.ts,
-                own,
-            });
+            self.push_msg(line.user, line.body, line.ts);
         }
     }
 
@@ -641,8 +705,8 @@ impl App {
             "help" | "h" | "?" => {
                 self.system(
                     "/invite one-paste invite · /key show the room key · /nick <name> rename \
-                     · /who occupancy · /clear wipe the view · /forget erase saved history \
-                     · /quit",
+                     · /who occupancy · /notify mentions|all|off · Ctrl-F search \
+                     · /clear wipe the view · /forget erase saved history · /quit",
                     Level::Info,
                 );
                 Action::None
@@ -692,6 +756,38 @@ impl App {
             }
             "clear" => {
                 self.entries.clear();
+                Action::None
+            }
+            "notify" => {
+                if arg.is_empty() {
+                    self.system(
+                        format!(
+                            "Notifications: {}. /notify mentions|all|off to change.",
+                            self.notify.as_str()
+                        ),
+                        Level::Info,
+                    );
+                    return Action::None;
+                }
+                match Notify::parse(&arg) {
+                    Some(mode) => {
+                        self.notify = mode;
+                        self.vault.notify = mode.as_str().to_string();
+                        let detail = match mode {
+                            Notify::Mentions => "a bell and a notification when someone says @you",
+                            Notify::All => "a bell and a notification for every message",
+                            Notify::Off => "no bells, no notifications",
+                        };
+                        self.system(
+                            format!(
+                                "Notifications: {} — {detail}, while this window isn't focused.",
+                                mode.as_str()
+                            ),
+                            Level::Good,
+                        );
+                    }
+                    None => self.system("Usage: /notify mentions|all|off", Level::Bad),
+                }
                 Action::None
             }
             "forget" => {
@@ -817,6 +913,22 @@ fn ensure_path(host_and_path: &str) -> String {
     } else {
         format!("{host_and_path}/ws")
     }
+}
+
+/// Whether `body` addresses `name` as `@name`, ignoring case. The mention
+/// must end at a word boundary, so `@bmo` doesn't fire for `@bmobile`.
+pub fn mentions(body: &str, name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let body = body.to_lowercase();
+    let needle = format!("@{}", name.to_lowercase());
+    body.match_indices(&needle).any(|(at, _)| {
+        body[at + needle.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| !(c.is_alphanumeric() || c == '_' || c == '-'))
+    })
 }
 
 /// Byte offset of character `index`, or the end of the string.
@@ -1175,6 +1287,72 @@ mod tests {
         // And a second replay doesn't save it twice.
         app.absorb_backlog(vec![said("sam", "from before", 1)]);
         assert_eq!(app.vault.history.len(), 1);
+    }
+
+    #[test]
+    fn mentions_need_the_at_and_a_word_boundary() {
+        assert!(mentions("hey @bmo look", "bmo"));
+        assert!(mentions("@BMO!", "bmo"), "case doesn't matter");
+        assert!(mentions("ping @bmo", "bmo"), "end of text counts");
+        assert!(
+            !mentions("hey bmo", "bmo"),
+            "the @ is what makes it a mention"
+        );
+        assert!(!mentions("@bmobile", "bmo"), "not a prefix match");
+        assert!(mentions("@bmobile and @bmo", "bmo"));
+        assert!(!mentions("@", ""));
+    }
+
+    #[test]
+    fn a_live_mention_raises_an_alert_without_the_text() {
+        let mut app = app();
+        app.absorb(said("sam", "@bmo the secret plan", 1), false);
+        let alert = app.alert.take().expect("a mention should alert");
+        assert!(alert.contains("sam"));
+        assert!(
+            !alert.contains("secret"),
+            "message text must stay out of the OS"
+        );
+        assert!(matches!(
+            app.entries.last(),
+            Some(Entry::Msg { mention: true, .. })
+        ));
+    }
+
+    #[test]
+    fn alerts_respect_focus_mode_and_history() {
+        let mut app = app();
+        app.absorb(said("sam", "no mention here", 1), false);
+        assert!(app.alert.is_none(), "mentions mode ignores ordinary lines");
+
+        app.absorb(said("sam", "@bmo from before", 2), true);
+        assert!(app.alert.is_none(), "replayed history never alerts");
+
+        app.absorb(said("bmo", "@bmo talking to myself", 3), false);
+        assert!(app.alert.is_none(), "your own lines never alert");
+
+        app.focused = Some(true);
+        app.absorb(said("sam", "@bmo while you're looking", 4), false);
+        assert!(app.alert.is_none(), "no need while the window has focus");
+
+        app.focused = Some(false);
+        app.notify = Notify::All;
+        app.absorb(said("sam", "anything", 5), false);
+        assert!(app.alert.take().is_some());
+
+        app.notify = Notify::Off;
+        app.absorb(said("sam", "@bmo", 6), false);
+        assert!(app.alert.is_none());
+    }
+
+    #[test]
+    fn notify_is_set_by_command_and_saved() {
+        let mut app = app();
+        assert_eq!(app.run_command("notify all"), Action::None);
+        assert_eq!(app.notify, Notify::All);
+        assert_eq!(app.vault.notify, "all");
+        app.run_command("notify nonsense");
+        assert_eq!(app.notify, Notify::All, "a typo changes nothing");
     }
 
     #[test]

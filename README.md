@@ -173,6 +173,7 @@ Type to talk. Enter sends.
 | `/key` | show just the room key |
 | `/nick <name>` | change your name |
 | `/who` | how many connections are in the room |
+| `/notify mentions\|all\|off` | when to ring and notify (default: `@you` only) |
 | `/clear` | wipe the view |
 | `/forget` | erase saved history from your vault |
 | `/quit` | leave |
@@ -196,6 +197,13 @@ rustchat invite --relay … --access-key … --room-key …
 `RUSTCHAT_INVITE`, `RUSTCHAT_ROOM_KEY` and `RUSTCHAT_ACCESS_KEY` do the same as
 the matching flags without putting secrets in your shell history or in `ps`
 output.
+
+When the window isn't focused, a message that says `@yourname` rings the
+bell and raises a desktop notification, in terminals that support one (iTerm2,
+WezTerm, Ghostty, kitty, Windows Terminal; under tmux, also
+`set -g allow-passthrough on`). The notification says who, never what: message
+text stays out of your OS's notification centre. Mentions also get a marker in
+the transcript.
 
 ### "the relay turned us away"
 
