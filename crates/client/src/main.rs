@@ -81,7 +81,16 @@ struct Cli {
     identity: Option<String>,
 
     /// Don't check GitHub for a newer release on launch.
-    #[arg(long, env = update::OPT_OUT_ENV)]
+    ///
+    /// The environment variable takes any of the usual spellings — `1`,
+    /// `true`, `yes`, `on` — not just clap's default of `true`/`false`: the
+    /// README says `=1`, and every released updater relaunches with `=1`.
+    #[arg(
+        long,
+        env = update::OPT_OUT_ENV,
+        action = clap::ArgAction::SetTrue,
+        value_parser = clap::builder::BoolishValueParser::new(),
+    )]
     no_update_check: bool,
 
     #[command(subcommand)]
