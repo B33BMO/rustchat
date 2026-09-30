@@ -108,6 +108,12 @@ On a systemd host:
 sudo sh deploy/setup-relay.sh --auth-key <auth key> --port 7777
 ```
 
+A client that disappears without closing — a laptop that slept, a tunnel that
+dropped — leaves a socket the relay still sees as open. It pings quiet
+connections and drops anything silent for `--idle-timeout` seconds (90 by
+default, against a client ping every 30), so a room's headcount reflects who
+is actually there.
+
 That installs the binary, writes a locked-down unit, and starts it on
 loopback. The relay speaks plain HTTP on purpose — put something in front of it
 that terminates TLS. With Cloudflare Tunnel, add to your ingress list:

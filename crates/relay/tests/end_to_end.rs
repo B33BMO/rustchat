@@ -30,6 +30,45 @@ fn unb64(s: &str) -> Vec<u8> {
 struct Relay {
     child: tokio::process::Child,
     url: String,
+    addr: String,
+}
+
+impl Relay {
+    /// How many connections the relay currently believes it has.
+    async fn connections(&self) -> usize {
+        let body = reqwest_get(&format!("http://{}/health", self.addr)).await;
+        let value: serde_json::Value = serde_json::from_str(&body).expect("health json");
+        value["connections"].as_u64().expect("connections") as usize
+    }
+
+    /// Polls until the connection count reaches `want`, or gives up.
+    async fn wait_for_connections(&self, want: usize, within: Duration) -> usize {
+        let deadline = std::time::Instant::now() + within;
+        let mut seen = self.connections().await;
+        while std::time::Instant::now() < deadline && seen != want {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            seen = self.connections().await;
+        }
+        seen
+    }
+}
+
+/// A one-line HTTP GET, to avoid pulling an HTTP client in just for /health.
+async fn reqwest_get(url: &str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (host, path) = url.trim_start_matches("http://").split_once('/').unwrap();
+    let mut stream = tokio::net::TcpStream::connect(host).await.expect("connect");
+    let request = format!("GET /{path} HTTP/1.0\r\nHost: {host}\r\n\r\n");
+    stream.write_all(request.as_bytes()).await.expect("write");
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .await
+        .expect("read health response");
+    response
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_string())
+        .unwrap_or(response)
 }
 
 impl Drop for Relay {
@@ -40,6 +79,11 @@ impl Drop for Relay {
 
 /// Starts a relay on an OS-assigned port and waits until it is listening.
 async fn start_relay(auth_hex: &str, history: usize) -> Relay {
+    start_relay_with(auth_hex, history, 90).await
+}
+
+/// As [`start_relay`], with an explicit idle timeout in seconds.
+async fn start_relay_with(auth_hex: &str, history: usize, idle_secs: u64) -> Relay {
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_rustchat-relay"))
         .args([
             "--bind",
@@ -48,6 +92,8 @@ async fn start_relay(auth_hex: &str, history: usize) -> Relay {
             auth_hex,
             "--history",
             &history.to_string(),
+            "--idle-timeout",
+            &idle_secs.to_string(),
         ])
         .stderr(Stdio::piped())
         .stdout(Stdio::null())
@@ -75,6 +121,7 @@ async fn start_relay(auth_hex: &str, history: usize) -> Relay {
     Relay {
         child,
         url: format!("ws://{addr}/ws"),
+        addr,
     }
 }
 
@@ -596,4 +643,84 @@ async fn the_relay_cannot_tell_which_room_key_produced_an_id() {
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+// --- noticing clients that vanished ----------------------------------------
+
+#[tokio::test]
+async fn a_client_that_vanishes_stops_being_counted() {
+    // A peer that goes away without closing — a sleeping laptop, a dropped
+    // tunnel — leaves a socket that still looks open from the relay's side.
+    // Silence is the only evidence, so the relay has to act on it or the
+    // room's headcount stays wrong forever.
+    let access = AccessKey::generate();
+    let key = RoomKey::generate();
+    let relay = start_relay_with(&access.auth_hex(), 200, 2).await;
+
+    let ghost = join(&relay.url, &access, &key).await;
+    assert_eq!(
+        relay.wait_for_connections(1, Duration::from_secs(5)).await,
+        1
+    );
+
+    // Keep the socket open at the OS level but never poll it again: no reads,
+    // no writes, not even the automatic Pong. Exactly what a vanished peer
+    // looks like from here.
+    std::mem::forget(ghost);
+
+    let after = relay.wait_for_connections(0, Duration::from_secs(20)).await;
+    assert_eq!(after, 0, "a silent connection should have been dropped");
+}
+
+#[tokio::test]
+async fn a_client_that_keeps_talking_is_left_alone() {
+    // The other half of the contract: the idle timeout must not cut off
+    // someone who is simply not typing.
+    let access = AccessKey::generate();
+    let key = RoomKey::generate();
+    let relay = start_relay_with(&access.auth_hex(), 200, 3).await;
+
+    let mut alice = join(&relay.url, &access, &key).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(7);
+    while std::time::Instant::now() < deadline {
+        send(&mut alice, &ClientMsg::Ping).await;
+        // Draining replies is what a real client does, and is also what
+        // sends the automatic Pong for the relay's own heartbeat.
+        let _ = tokio::time::timeout(Duration::from_millis(400), next_msg(&mut alice)).await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+    }
+
+    assert_eq!(
+        relay.connections().await,
+        1,
+        "a client that keeps answering must not be dropped"
+    );
+}
+
+#[tokio::test]
+async fn a_vanished_client_frees_its_room() {
+    // The room should be reclaimable afterwards, not pinned open by a ghost.
+    let access = AccessKey::generate();
+    let key = RoomKey::generate();
+    let relay = start_relay_with(&access.auth_hex(), 200, 2).await;
+
+    let ghost = join(&relay.url, &access, &key).await;
+    std::mem::forget(ghost);
+    assert_eq!(
+        relay.wait_for_connections(0, Duration::from_secs(20)).await,
+        0
+    );
+
+    // A fresh client can still use the same room, and finds itself alone.
+    let mut alice = join(&relay.url, &access, &key).await;
+    send(&mut alice, &ClientMsg::Ping).await;
+    loop {
+        match next_msg(&mut alice).await {
+            Some(RelayMsg::Pong) => break,
+            Some(RelayMsg::Occupants { occupants }) => {
+                assert_eq!(occupants, 1, "the ghost should not still be counted");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
 }

@@ -36,6 +36,9 @@ use tokio::sync::{Mutex, broadcast};
 
 /// A client gets this long to answer the challenge before being dropped.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often to probe an otherwise silent connection, and to check whether it
+/// has gone quiet for too long.
+const PING_INTERVAL: Duration = Duration::from_secs(30);
 /// Sustained send rate per connection, messages per second.
 const RATE_PER_SEC: f64 = 5.0;
 /// How many messages a connection may burst above the sustained rate.
@@ -85,6 +88,15 @@ struct Args {
     /// Maximum rooms held at once, including empty ones awaiting eviction.
     #[arg(long, env = "RUSTCHAT_MAX_ROOMS", default_value_t = 64)]
     max_rooms: usize,
+
+    /// Seconds of silence before a connection is assumed dead and dropped.
+    ///
+    /// A client that vanishes without closing — a sleeping laptop, a dropped
+    /// tunnel — leaves a socket that looks open from here. Without this it
+    /// would occupy its room indefinitely and keep inflating the headcount.
+    /// Clients ping every 30s, so the default allows three missed pings.
+    #[arg(long, env = "RUSTCHAT_IDLE_TIMEOUT", default_value_t = 90)]
+    idle_timeout: u64,
 }
 
 /// What travels on a room's broadcast channel.
@@ -98,6 +110,48 @@ enum Broadcast {
     Envelope(SealedEnvelope),
     Occupancy,
 }
+
+/// Counts rejected connections and reports them at most once a minute.
+///
+/// A public relay gets knocked on constantly by scanners and stray monitors.
+/// One log line each buries everything else: at a knock every five seconds
+/// that is over ten thousand lines a day, and a genuine disconnect becomes
+/// impossible to find among them.
+struct RejectionLog {
+    count: AtomicUsize,
+    last_report: std::sync::Mutex<Instant>,
+    interval: Duration,
+}
+
+impl RejectionLog {
+    fn new(interval: Duration) -> Self {
+        Self {
+            count: AtomicUsize::new(0),
+            last_report: std::sync::Mutex::new(Instant::now()),
+            interval,
+        }
+    }
+
+    /// Records a rejection, returning a line to log if one is due.
+    fn record(&self) -> Option<String> {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        let mut last = self.last_report.lock().ok()?;
+        let elapsed = last.elapsed();
+        if elapsed < self.interval {
+            return None;
+        }
+        *last = Instant::now();
+        let total = self.count.swap(0, Ordering::Relaxed);
+        Some(format!(
+            "turned away {total} unauthenticated connection{} in the last {}s",
+            if total == 1 { "" } else { "s" },
+            elapsed.as_secs()
+        ))
+    }
+}
+
+/// How often to summarise rejected connections.
+const REJECTION_REPORT_INTERVAL: Duration = Duration::from_secs(60);
 
 /// A replay buffer, bounded by both message count and total bytes.
 #[derive(Default)]
@@ -163,6 +217,11 @@ struct AppState {
     history_limit: usize,
     max_conns: usize,
     max_rooms: usize,
+    idle_timeout: Duration,
+    /// Rejections are counted and reported periodically rather than logged
+    /// one per line. Anything scanning a public address will knock constantly,
+    /// and a line each drowns every event worth reading.
+    rejections: RejectionLog,
     rooms: Mutex<HashMap<RoomId, Arc<Room>>>,
     /// Connections across all rooms, for the global cap.
     connections: AtomicUsize,
@@ -224,6 +283,8 @@ async fn main() -> Result<()> {
         history_limit: args.history,
         max_conns: args.max_conns,
         max_rooms: args.max_rooms,
+        idle_timeout: Duration::from_secs(args.idle_timeout),
+        rejections: RejectionLog::new(REJECTION_REPORT_INTERVAL),
         rooms: Mutex::new(HashMap::new()),
         connections: AtomicUsize::new(0),
     });
@@ -252,11 +313,12 @@ async fn main() -> Result<()> {
     let bound = listener.local_addr().context("reading the bound address")?;
     eprintln!(
         "rustchat-relay v{} listening on {bound} (protocol v{PROTOCOL_VERSION}, \
-         history {}/room, max conns {}, max rooms {})",
+         history {}/room, max conns {}, max rooms {}, idle timeout {}s)",
         env!("CARGO_PKG_VERSION"),
         args.history,
         args.max_conns,
-        args.max_rooms
+        args.max_rooms,
+        args.idle_timeout
     );
 
     axum::serve(listener, app)
@@ -338,7 +400,10 @@ async fn serve_socket(socket: WebSocket, state: Arc<AppState>) -> Result<()> {
         )
         .await;
         let _ = sink.close().await;
-        anyhow::bail!("rejected an unauthenticated client");
+        if let Some(line) = state.rejections.record() {
+            eprintln!("{line}");
+        }
+        return Ok(());
     };
 
     // --- Join the room ----------------------------------------------------
@@ -376,6 +441,18 @@ async fn serve_socket(socket: WebSocket, state: Arc<AppState>) -> Result<()> {
 
     // --- Pump -------------------------------------------------------------
     let mut bucket = TokenBucket::new(RATE_BURST, RATE_PER_SEC);
+    // Any frame at all counts as a sign of life, including the Pong that a
+    // conforming client's library sends back automatically.
+    let mut last_seen = Instant::now();
+    // Check often enough to honour the configured timeout rather than only
+    // at the ping cadence, or a short timeout would not be observed until
+    // the next ping came due.
+    let check_every = (state.idle_timeout / 3)
+        .min(PING_INTERVAL)
+        .max(Duration::from_secs(1));
+    let mut heartbeat = tokio::time::interval(check_every);
+    heartbeat.tick().await; // The first tick fires immediately; skip it.
+
     loop {
         tokio::select! {
             // Outbound: anything published to this room.
@@ -400,9 +477,22 @@ async fn serve_socket(socket: WebSocket, state: Arc<AppState>) -> Result<()> {
                 }
             }
 
+            // Probe a quiet connection, and give up on one that has not made
+            // a sound in a long time. A vanished peer leaves a socket that
+            // still looks open from here, so silence is the only evidence.
+            _ = heartbeat.tick() => {
+                if last_seen.elapsed() > state.idle_timeout {
+                    break;
+                }
+                if sink.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    break;
+                }
+            }
+
             // Inbound: what this client wants to say.
             frame = stream.next() => {
                 let Some(frame) = frame else { break };
+                last_seen = Instant::now();
                 match frame? {
                     Message::Text(text) => {
                         let Ok(msg) = serde_json::from_str::<ClientMsg>(&text) else {
@@ -696,6 +786,50 @@ mod tests {
     }
 
     #[test]
+    fn rejections_are_summarised_not_logged_one_by_one() {
+        // The point of the aggregator: a scanner knocking constantly must not
+        // be able to bury every other line in the journal.
+        let log = RejectionLog::new(Duration::from_millis(80));
+        assert!(
+            log.record().is_none(),
+            "the first knock waits for the window"
+        );
+        for _ in 0..500 {
+            assert!(log.record().is_none());
+        }
+        std::thread::sleep(Duration::from_millis(90));
+        let line = log
+            .record()
+            .expect("a summary is due once the window passes");
+        assert!(line.contains("502"), "should count every rejection: {line}");
+        assert!(line.contains("turned away"), "{line}");
+    }
+
+    #[test]
+    fn the_rejection_count_resets_after_reporting() {
+        let log = RejectionLog::new(Duration::from_millis(50));
+        for _ in 0..10 {
+            log.record();
+        }
+        std::thread::sleep(Duration::from_millis(60));
+        log.record().expect("first summary");
+        std::thread::sleep(Duration::from_millis(60));
+        let line = log.record().expect("second summary");
+        assert!(
+            line.contains("away 1 "),
+            "the count should start again from zero: {line}"
+        );
+    }
+
+    #[test]
+    fn one_rejection_reads_as_singular() {
+        let log = RejectionLog::new(Duration::from_millis(30));
+        std::thread::sleep(Duration::from_millis(40));
+        let line = log.record().unwrap();
+        assert!(line.contains("1 unauthenticated connection in"), "{line}");
+    }
+
+    #[test]
     fn base64_roundtrips() {
         assert_eq!(unb64(&b64(b"hello")).unwrap(), b"hello");
     }
@@ -706,6 +840,8 @@ mod tests {
             history_limit: 10,
             max_conns: 100,
             max_rooms,
+            idle_timeout: Duration::from_secs(90),
+            rejections: RejectionLog::new(REJECTION_REPORT_INTERVAL),
             rooms: Mutex::new(HashMap::new()),
             connections: AtomicUsize::new(0),
         })

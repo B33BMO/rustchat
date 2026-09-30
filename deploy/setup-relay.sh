@@ -97,6 +97,9 @@ RUSTCHAT_BIND=127.0.0.1:$PORT
 RUSTCHAT_HISTORY=$HISTORY
 RUSTCHAT_MAX_CONNS=200
 RUSTCHAT_MAX_ROOMS=64
+# Seconds of silence before a connection is assumed dead. Clients ping every
+# 30s, so this allows three missed pings.
+RUSTCHAT_IDLE_TIMEOUT=90
 EOF
 chmod 600 "$ENV_FILE"
 
