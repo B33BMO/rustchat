@@ -56,6 +56,9 @@ pub struct VaultData {
     pub username: String,
     #[serde(default)]
     pub history: Vec<StoredLine>,
+    /// Notification mode: "mentions", "all" or "off". Empty means the default.
+    #[serde(default)]
+    pub notify: String,
 }
 
 impl VaultData {
@@ -188,6 +191,7 @@ mod tests {
                 body: "hello".into(),
                 ts: 1,
             }],
+            notify: "all".into(),
         }
     }
 

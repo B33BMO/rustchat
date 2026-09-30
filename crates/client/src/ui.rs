@@ -141,6 +141,7 @@ fn build_transcript(app: &App, width: usize) -> Vec<Line<'static>> {
                 body,
                 ts,
                 own,
+                mention,
             } => {
                 if last_speaker.as_deref() != Some(user.as_str()) {
                     if !out.is_empty() {
@@ -161,11 +162,18 @@ fn build_transcript(app: &App, width: usize) -> Vec<Line<'static>> {
                     out.push(Line::from(spans));
                     last_speaker = Some(user.clone());
                 }
+                // A mention gets a bar down its left edge, so it can be found
+                // again at a glance when scrolling back.
+                let gutter = if *mention {
+                    Span::styled(
+                        format!(" ┃{}", " ".repeat(BODY_INDENT - 2)),
+                        Style::default().fg(WARN),
+                    )
+                } else {
+                    Span::raw(" ".repeat(BODY_INDENT))
+                };
                 for chunk in wrap(body, width.saturating_sub(BODY_INDENT)) {
-                    out.push(Line::from(vec![
-                        Span::raw(" ".repeat(BODY_INDENT)),
-                        Span::raw(chunk),
-                    ]));
+                    out.push(Line::from(vec![gutter.clone(), Span::raw(chunk)]));
                 }
             }
             Entry::Presence { user, joined, ts } => {
