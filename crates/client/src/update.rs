@@ -45,7 +45,10 @@ pub fn offer(opted_out: bool) {
     if std::io::stdin().lock().read_line(&mut answer).is_err() {
         return;
     }
-    if !matches!(answer.trim().to_ascii_lowercase().as_str(), "" | "y" | "yes") {
+    if !matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "" | "y" | "yes"
+    ) {
         println!("Skipping. (Set {OPT_OUT_ENV}=1 to stop asking.)\n");
         return;
     }
