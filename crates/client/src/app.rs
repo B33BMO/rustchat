@@ -74,6 +74,15 @@ impl Notify {
     }
 }
 
+/// An open `Ctrl-F` search over the transcript.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Search {
+    pub query: String,
+    /// Which match is in view, counted back from the newest: 0 is the most
+    /// recent, because what you're after is usually recent.
+    pub current: usize,
+}
+
 /// Connection state, as far as the UI is concerned.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Status {
@@ -232,6 +241,8 @@ pub struct App {
     /// A notification waiting to be written to the terminal. Taken by the
     /// event loop, which owns stdout; the app only decides one is due.
     pub alert: Option<String>,
+    /// Set while searching; the input box edits the query instead.
+    pub search: Option<Search>,
 }
 
 impl App {
@@ -256,7 +267,77 @@ impl App {
             notify: Notify::Mentions,
             focused: None,
             alert: None,
+            search: None,
         }
+    }
+
+    /// Indices into `entries` of every chat line matching the open search,
+    /// oldest first. Matches on the text or the sender's name.
+    pub fn search_matches(&self) -> Vec<usize> {
+        let Some(search) = &self.search else {
+            return Vec::new();
+        };
+        if search.query.is_empty() {
+            return Vec::new();
+        }
+        self.entries
+            .iter()
+            .enumerate()
+            .filter_map(|(i, entry)| match entry {
+                Entry::Msg { user, body, .. }
+                    if find_ci(body, &search.query).is_some()
+                        || find_ci(user, &search.query).is_some() =>
+                {
+                    Some(i)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The entry the search is sitting on, if any.
+    pub fn search_focus(&self) -> Option<usize> {
+        let current = self.search.as_ref()?.current;
+        let matches = self.search_matches();
+        matches.len().checked_sub(current + 1).map(|i| matches[i])
+    }
+
+    fn on_key_search(&mut self, key: KeyEvent) -> Action {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let total = self.search_matches().len();
+        let Some(search) = self.search.as_mut() else {
+            return Action::None;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.search = None;
+                self.scroll = 0;
+            }
+            // Older: Enter and Ctrl-F again, like most find bars.
+            KeyCode::Up | KeyCode::Enter | KeyCode::PageUp => {
+                search.current = (search.current + 1).min(total.saturating_sub(1));
+            }
+            KeyCode::Char('f') if ctrl => {
+                search.current = (search.current + 1).min(total.saturating_sub(1));
+            }
+            KeyCode::Down | KeyCode::PageDown => {
+                search.current = search.current.saturating_sub(1);
+            }
+            KeyCode::Backspace => {
+                search.query.pop();
+                search.current = 0;
+            }
+            KeyCode::Char('u') if ctrl => {
+                search.query.clear();
+                search.current = 0;
+            }
+            KeyCode::Char(c) if !ctrl => {
+                search.query.push(c);
+                search.current = 0;
+            }
+            _ => {}
+        }
+        Action::None
     }
 
     /// Adds a chat line to the transcript, working out how to mark it.
@@ -619,7 +700,11 @@ impl App {
 
     fn on_key_chat(&mut self, key: KeyEvent) -> Action {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if self.search.is_some() {
+            return self.on_key_search(key);
+        }
         match key.code {
+            KeyCode::Char('f') if ctrl => self.search = Some(Search::default()),
             KeyCode::Enter => return self.submit_input(),
             KeyCode::Char('u') if ctrl => {
                 self.input.clear();
@@ -913,6 +998,22 @@ fn ensure_path(host_and_path: &str) -> String {
     } else {
         format!("{host_and_path}/ws")
     }
+}
+
+/// Where `needle` first occurs in `hay` ignoring case, as a range of *char*
+/// indices. Char-wise rather than lowercasing whole strings, because
+/// lowercasing can change byte lengths and the UI needs positions that line
+/// up with the original text.
+pub fn find_ci(hay: &str, needle: &str) -> Option<std::ops::Range<usize>> {
+    let fold = |c: char| c.to_lowercase().next().unwrap_or(c);
+    let hay: Vec<char> = hay.chars().map(fold).collect();
+    let needle: Vec<char> = needle.chars().map(fold).collect();
+    if needle.is_empty() || needle.len() > hay.len() {
+        return None;
+    }
+    (0..=hay.len() - needle.len())
+        .find(|&i| hay[i..i + needle.len()] == needle[..])
+        .map(|i| i..i + needle.len())
 }
 
 /// Whether `body` addresses `name` as `@name`, ignoring case. The mention
@@ -1353,6 +1454,72 @@ mod tests {
         assert_eq!(app.vault.notify, "all");
         app.run_command("notify nonsense");
         assert_eq!(app.notify, Notify::All, "a typo changes nothing");
+    }
+
+    fn type_keys(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn case_insensitive_find_reports_char_positions() {
+        assert_eq!(find_ci("Hello World", "world"), Some(6..11));
+        assert_eq!(find_ci("héllo", "LLO"), Some(2..5), "chars, not bytes");
+        assert_eq!(find_ci("abc", ""), None);
+        assert_eq!(find_ci("ab", "abc"), None);
+    }
+
+    #[test]
+    fn search_walks_from_newest_to_oldest() {
+        let mut app = app();
+        for (i, body) in ["deploy failed", "lunch?", "Deploy fixed", "ok"]
+            .iter()
+            .enumerate()
+        {
+            app.absorb(said("sam", body, i as i64), false);
+        }
+        app.on_key(ctrl('f'));
+        type_keys(&mut app, "deploy");
+        assert_eq!(app.search_matches().len(), 2);
+        assert_eq!(app.search_focus(), Some(2), "starts on the newest match");
+        app.on_key(key(KeyCode::Up));
+        assert_eq!(app.search_focus(), Some(0));
+        app.on_key(key(KeyCode::Up));
+        assert_eq!(app.search_focus(), Some(0), "stops at the oldest");
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(app.search_focus(), Some(2));
+    }
+
+    #[test]
+    fn search_typing_edits_the_query_not_the_message() {
+        let mut app = app();
+        app.input = "half a message".into();
+        app.on_key(ctrl('f'));
+        type_keys(&mut app, "x");
+        assert_eq!(app.input, "half a message", "the draft is left alone");
+        assert_eq!(
+            app.on_key(key(KeyCode::Enter)),
+            Action::None,
+            "Enter doesn't send"
+        );
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.search.is_none());
+        assert_eq!(app.input, "half a message");
+    }
+
+    #[test]
+    fn search_matches_names_too() {
+        let mut app = app();
+        app.absorb(said("sam", "hi", 1), false);
+        app.absorb(said("alex", "hi", 2), false);
+        app.on_key(ctrl('f'));
+        type_keys(&mut app, "SAM");
+        assert_eq!(app.search_matches(), vec![0]);
     }
 
     #[test]

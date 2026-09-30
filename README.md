@@ -165,6 +165,7 @@ Type to talk. Enter sends.
 | `Ctrl-A` / `Ctrl-E` | start / end of line |
 | `Ctrl-U` | clear the line |
 | `Ctrl-L` | clear the view |
+| `Ctrl-F` | search the transcript — `↑`/`Enter` older, `↓` newer, `Esc` done |
 | `Ctrl-C` | quit |
 
 | Command | |

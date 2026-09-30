@@ -6,7 +6,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
 
-use crate::app::{App, Entry, Level, Screen, Setup, Status, Step, Unlock};
+use crate::app::{App, Entry, Level, Screen, Setup, Status, Step, Unlock, find_ci};
 
 // A small, deliberate palette. The terminal's own background is left alone so
 // rustchat sits inside whatever theme someone already likes.
@@ -55,10 +55,20 @@ fn draw_chat(frame: &mut Frame, app: &App) {
     // to Paragraph's own wrapping, because scrolling needs to be in units of
     // *rendered* lines for the view to move predictably.
     let width = body.width.saturating_sub(1) as usize;
-    let lines = build_transcript(app, width.max(8));
+    let (lines, starts) = build_transcript(app, width.max(8));
     let height = body.height as usize;
     let max_scroll = lines.len().saturating_sub(height);
-    let scroll = (app.scroll as usize).min(max_scroll);
+    // While searching, the view follows the match rather than the scroll
+    // position: the match's first line sits a third of the way down, leaving
+    // room to read what came after it.
+    let wanted = match app.search_focus() {
+        Some(entry) => {
+            let line = starts[entry];
+            lines.len().saturating_sub(line + height - height / 3)
+        }
+        None => app.scroll as usize,
+    };
+    let scroll = wanted.min(max_scroll);
     let start = lines.len().saturating_sub(height + scroll);
     let end = lines.len().saturating_sub(scroll);
     let window: Vec<Line> = lines[start..end].to_vec();
@@ -96,29 +106,44 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_input(frame: &mut Frame, area: Rect, app: &App, scrolled: bool) {
-    let title = if scrolled {
-        " scrolled up — End or Esc to jump back "
-    } else if app.input.starts_with('/') {
-        " command "
-    } else {
-        " message "
+    let search_title;
+    let (title, border, text, cursor) = match &app.search {
+        Some(search) => {
+            let total = app.search_matches().len();
+            search_title = if search.query.is_empty() {
+                " search — type to find · Esc done ".to_string()
+            } else if total == 0 {
+                " search · no matches · Esc done ".to_string()
+            } else {
+                format!(
+                    " search · {} of {total} · ↑ older ↓ newer · Esc done ",
+                    total - search.current
+                )
+            };
+            let query = search.query.as_str();
+            (search_title.as_str(), ACCENT, query, query.chars().count())
+        }
+        None if scrolled => (
+            " scrolled up — End or Esc to jump back ",
+            WARN,
+            app.input.as_str(),
+            app.cursor,
+        ),
+        None if app.input.starts_with('/') => (" command ", DIM, app.input.as_str(), app.cursor),
+        None => (" message ", DIM, app.input.as_str(), app.cursor),
     };
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(if scrolled { WARN } else { DIM }))
+        .border_style(Style::default().fg(border))
         .title_top(Span::styled(title, Style::default().fg(DIM)));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     // Scroll the input horizontally so the caret stays visible on long lines.
     let width = inner.width as usize;
-    let caret = display_width(&app.input, app.cursor);
+    let caret = display_width(text, cursor);
     let offset = caret.saturating_sub(width.saturating_sub(1));
-    let visible: String = app
-        .input
-        .chars()
-        .skip(char_at_width(&app.input, offset))
-        .collect();
+    let visible: String = text.chars().skip(char_at_width(text, offset)).collect();
 
     frame.render_widget(Paragraph::new(visible), inner);
     frame.set_cursor_position((
@@ -127,14 +152,23 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App, scrolled: bool) {
     ));
 }
 
-/// Renders the transcript into exactly-wrapped lines, oldest first.
-fn build_transcript(app: &App, width: usize) -> Vec<Line<'static>> {
+/// Renders the transcript into exactly-wrapped lines, oldest first, along
+/// with the line each entry starts on (so a search can scroll to one).
+fn build_transcript(app: &App, width: usize) -> (Vec<Line<'static>>, Vec<usize>) {
     let mut out: Vec<Line<'static>> = Vec::new();
+    let mut starts = Vec::with_capacity(app.entries.len());
+    let query = app
+        .search
+        .as_ref()
+        .map(|s| s.query.as_str())
+        .filter(|q| !q.is_empty());
+    let focus = app.search_focus();
     // Consecutive messages from one person share a single name header, which
     // keeps a back-and-forth readable without repeating the name every line.
     let mut last_speaker: Option<String> = None;
 
-    for entry in &app.entries {
+    for (index, entry) in app.entries.iter().enumerate() {
+        starts.push(out.len());
         match entry {
             Entry::Msg {
                 user,
@@ -173,7 +207,12 @@ fn build_transcript(app: &App, width: usize) -> Vec<Line<'static>> {
                     Span::raw(" ".repeat(BODY_INDENT))
                 };
                 for chunk in wrap(body, width.saturating_sub(BODY_INDENT)) {
-                    out.push(Line::from(vec![gutter.clone(), Span::raw(chunk)]));
+                    let mut spans = vec![gutter.clone()];
+                    match query {
+                        Some(q) => spans.extend(highlight(&chunk, q, focus == Some(index))),
+                        None => spans.push(Span::raw(chunk)),
+                    }
+                    out.push(Line::from(spans));
                 }
             }
             Entry::Presence { user, joined, ts } => {
@@ -210,7 +249,47 @@ fn build_transcript(app: &App, width: usize) -> Vec<Line<'static>> {
             }
         }
     }
-    out
+    (out, starts)
+}
+
+/// Splits `text` into spans with every occurrence of `query` marked. The
+/// match being looked at is filled in; the others are only coloured.
+fn highlight(text: &str, query: &str, focused: bool) -> Vec<Span<'static>> {
+    let style = if focused {
+        Style::default()
+            .fg(Color::Black)
+            .bg(WARN)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(WARN).add_modifier(Modifier::UNDERLINED)
+    };
+    let chars: Vec<char> = text.chars().collect();
+    let mut spans = Vec::new();
+    let mut at = 0;
+    while at < chars.len() {
+        let rest: String = chars[at..].iter().collect();
+        match find_ci(&rest, query) {
+            Some(found) => {
+                if found.start > 0 {
+                    spans.push(Span::raw(
+                        chars[at..at + found.start].iter().collect::<String>(),
+                    ));
+                }
+                spans.push(Span::styled(
+                    chars[at + found.start..at + found.end]
+                        .iter()
+                        .collect::<String>(),
+                    style,
+                ));
+                at += found.end;
+            }
+            None => {
+                spans.push(Span::raw(rest));
+                break;
+            }
+        }
+    }
+    spans
 }
 
 // ---------------------------------------------------------------- unlock
@@ -703,6 +782,69 @@ mod tests {
         for line in wrap("日本語のテキストです", 6) {
             assert!(str_width(&line) <= 6, "{line:?}");
         }
+    }
+
+    #[test]
+    fn highlighting_keeps_every_character() {
+        let spans = highlight("Deploy the deploy", "DEPLOY", false);
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "Deploy the deploy");
+        assert_eq!(spans.len(), 3, "match, gap, match: {spans:?}");
+        assert_eq!(highlight("nothing", "zz", false).len(), 1);
+    }
+
+    #[test]
+    fn a_search_brings_an_old_match_into_view() {
+        use ratatui::backend::TestBackend;
+        use rustchat_core::Payload;
+
+        let mut app = App::new(
+            std::path::PathBuf::from("/tmp/nope"),
+            Screen::Chat,
+            "wss://x/ws".into(),
+            true,
+        );
+        app.username = "bmo".into();
+        app.absorb(
+            Payload::Msg {
+                user: "sam".into(),
+                body: "the needle is here".into(),
+                ts: 0,
+            },
+            false,
+        );
+        for i in 0..200 {
+            app.absorb(
+                Payload::Msg {
+                    user: if i % 2 == 0 { "sam" } else { "alex" }.into(),
+                    body: format!("filler {i}"),
+                    ts: 0,
+                },
+                false,
+            );
+        }
+        let screen = |app: &App| {
+            let mut terminal = ratatui::Terminal::new(TestBackend::new(60, 20)).unwrap();
+            terminal.draw(|f| draw(f, app)).unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            buffer
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>()
+        };
+        assert!(!screen(&app).contains("needle"), "starts at the bottom");
+
+        app.search = Some(crate::app::Search {
+            query: "needle".into(),
+            current: 0,
+        });
+        let shown = screen(&app);
+        assert!(
+            shown.contains("needle is here"),
+            "the match scrolls into view"
+        );
+        assert!(shown.contains("1 of 1"), "and the count shows");
     }
 
     #[test]
