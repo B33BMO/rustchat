@@ -11,6 +11,7 @@
 #   RUSTCHAT_VERSION      tag to install (default: the latest release)
 #   RUSTCHAT_INSTALL_DIR  where to put the binary
 #   RUSTCHAT_RELAY=1      also install rustchat-relay (for hosting a room)
+#   RUSTCHAT_NO_BUILD=1   fail rather than fall back to building from source
 #
 # Flags: --relay, --version <tag>, --dir <path>, --uninstall, --help
 
@@ -174,6 +175,9 @@ latest_version() {
 # --- build from source ------------------------------------------------------
 build_from_source() {
     reason="$1"
+    # Set by the in-app updater, which offered one specific release and should
+    # install exactly that or nothing.
+    [ -z "${RUSTCHAT_NO_BUILD:-}" ] || die "$reason"
     warn "$reason"
     have cargo || die "no prebuilt binary for this platform and no cargo to build one.
        Install Rust from https://rustup.rs and run this again."
