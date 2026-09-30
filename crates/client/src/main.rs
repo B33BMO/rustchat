@@ -9,6 +9,7 @@
 mod app;
 mod net;
 mod ui;
+mod update;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -66,6 +67,10 @@ struct Cli {
     #[arg(long)]
     vault: Option<PathBuf>,
 
+    /// Don't check GitHub for a newer release on launch.
+    #[arg(long, env = update::OPT_OUT_ENV)]
+    no_update_check: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -122,6 +127,8 @@ fn main() -> Result<()> {
         }
         Some(Command::Reset) => reset(&vault_path(&cli)?),
         None => {
+            // Before the TUI takes the terminal, so the prompt is plain text.
+            update::offer(cli.no_update_check);
             // The runtime is only built for the chat path; the subcommands
             // above are synchronous and shouldn't pay for it.
             tokio::runtime::Builder::new_multi_thread()
@@ -795,6 +802,7 @@ mod tests {
             username: None,
             no_vault: true,
             vault: None,
+            no_update_check: true,
             command: None,
         };
         let err = resolve_direct(&cli, DEFAULT_RELAY).unwrap_err().to_string();
@@ -819,6 +827,7 @@ mod tests {
             username: None,
             no_vault: true,
             vault: None,
+            no_update_check: true,
             command: None,
         };
         let (conn, room_back, access_back) = resolve_direct(&cli, DEFAULT_RELAY).unwrap().unwrap();
@@ -844,6 +853,7 @@ mod tests {
             username: None,
             no_vault: true,
             vault: None,
+            no_update_check: true,
             command: None,
         };
         let (conn, _, _) = resolve_direct(&cli, DEFAULT_RELAY).unwrap().unwrap();
@@ -868,6 +878,7 @@ mod tests {
             username: None,
             no_vault: true,
             vault: None,
+            no_update_check: true,
             command: None,
         };
         let err = resolve_direct(&cli, DEFAULT_RELAY).unwrap_err().to_string();

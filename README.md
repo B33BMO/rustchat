@@ -28,6 +28,11 @@ rustchat
 The first run walks you through creating or joining a room, and seals what it
 needs into an encrypted vault. After that it only asks for your passphrase.
 
+On launch it checks GitHub for a newer release and, if there is one, asks
+whether to update — installing it the same way, checksum and all, then
+restarting. That check is the only request rustchat makes to anything but your
+relay; turn it off with `--no-update-check` or `RUSTCHAT_NO_UPDATE_CHECK=1`.
+
 <details>
 <summary>Other ways to install</summary>
 
@@ -179,6 +184,7 @@ rustchat --invite rcinv1-…               # join straight from an invite
 rustchat --relay wss://elsewhere/ws      # a different relay, just this once
 rustchat --room-key rc1-… --access-key rca1-…   # skip the vault
 rustchat --no-vault                      # touch no disk at all
+rustchat --no-update-check               # don't look for a newer release
 rustchat where                           # where the vault lives
 rustchat reset                           # delete the vault and start over
 rustchat keygen                          # a new room key
