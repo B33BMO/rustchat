@@ -84,6 +84,10 @@ async fn start_relay(auth_hex: &str, history: usize) -> Relay {
 
 /// As [`start_relay`], with an explicit idle timeout in seconds.
 async fn start_relay_with(auth_hex: &str, history: usize, idle_secs: u64) -> Relay {
+    spawn_relay(auth_hex, history, idle_secs, &[]).await
+}
+
+async fn spawn_relay(auth_hex: &str, history: usize, idle_secs: u64, extra: &[&str]) -> Relay {
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_rustchat-relay"))
         .args([
             "--bind",
@@ -95,6 +99,7 @@ async fn start_relay_with(auth_hex: &str, history: usize, idle_secs: u64) -> Rel
             "--idle-timeout",
             &idle_secs.to_string(),
         ])
+        .args(extra)
         .stderr(Stdio::piped())
         .stdout(Stdio::null())
         .kill_on_drop(true)
@@ -723,4 +728,103 @@ async fn a_vanished_client_frees_its_room() {
             other => panic!("unexpected {other:?}"),
         }
     }
+}
+
+/// Waits for the backlog a join replays, skipping occupancy chatter.
+async fn history_of(socket: &mut Socket) -> Vec<SealedEnvelope> {
+    loop {
+        match next_msg(socket).await {
+            Some(RelayMsg::History { envs }) => return envs,
+            Some(RelayMsg::Occupants { .. }) => continue,
+            other => panic!("expected history, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn history_survives_a_restart_with_a_data_dir() {
+    // The case this exists for: say something, everyone leaves, the relay
+    // restarts, and a different device joins later and still sees it.
+    let dir = std::env::temp_dir().join(format!(
+        "rustchat-e2e-{}-{}",
+        std::process::id(),
+        rand_suffix()
+    ));
+    let dir_arg = dir.to_str().unwrap().to_string();
+    let access = AccessKey::generate();
+    let key = RoomKey::generate();
+
+    let relay = spawn_relay(&access.auth_hex(), 200, 90, &["--data-dir", &dir_arg]).await;
+    let mut laptop = join(&relay.url, &access, &key).await;
+    for body in ["first", "second"] {
+        send(
+            &mut laptop,
+            &ClientMsg::Send {
+                env: sealed(&key, "bmo", body),
+            },
+        )
+        .await;
+    }
+    // Wait for both echoes, so both are committed before the relay goes.
+    let mut echoed = 0;
+    while echoed < 2 {
+        if let Some(RelayMsg::Msg { .. }) = next_msg(&mut laptop).await {
+            echoed += 1;
+        }
+    }
+    drop(laptop);
+    drop(relay);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let relay = spawn_relay(&access.auth_hex(), 200, 90, &["--data-dir", &dir_arg]).await;
+    let mut phone = join(&relay.url, &access, &key).await;
+    let bodies: Vec<String> = history_of(&mut phone)
+        .await
+        .iter()
+        .map(|env| match open_envelope(&key, env) {
+            Payload::Msg { body, .. } => body,
+            other => panic!("expected chat, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(bodies, ["first", "second"]);
+
+    // And the files hold nothing readable.
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let text = std::fs::read_to_string(entry.unwrap().path()).unwrap();
+        assert!(!text.contains("first") && !text.contains("bmo"), "{text}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn without_a_data_dir_a_restart_forgets() {
+    let access = AccessKey::generate();
+    let key = RoomKey::generate();
+    let relay = start_relay(&access.auth_hex(), 200).await;
+    let mut alice = join(&relay.url, &access, &key).await;
+    send(
+        &mut alice,
+        &ClientMsg::Send {
+            env: sealed(&key, "alice", "ephemeral"),
+        },
+    )
+    .await;
+    let _ = next_msg(&mut alice).await;
+    drop(alice);
+    drop(relay);
+
+    let relay = start_relay(&access.auth_hex(), 200).await;
+    let mut bob = join(&relay.url, &access, &key).await;
+    // No history frame at all: the next thing is occupancy.
+    assert!(matches!(
+        next_msg(&mut bob).await,
+        Some(RelayMsg::Occupants { .. })
+    ));
+}
+
+fn rand_suffix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64
 }

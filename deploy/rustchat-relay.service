@@ -13,9 +13,12 @@ ExecStart=/usr/local/bin/rustchat-relay
 Restart=on-failure
 RestartSec=5s
 
-# The relay keeps its history in memory and reads no files beyond the
-# environment file systemd hands it, so it can be locked down hard.
+# The relay reads nothing beyond the environment file systemd hands it, and
+# writes only room backlogs — ciphertext it cannot read — into its state
+# directory (/var/lib/rustchat-relay), so it can be locked down hard.
 DynamicUser=yes
+StateDirectory=rustchat-relay
+StateDirectoryMode=0700
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes

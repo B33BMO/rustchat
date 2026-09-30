@@ -13,8 +13,11 @@
 //! access key can open rooms, and the access key is meant to be handed around,
 //! so the relay assumes its own users may misbehave.
 
-use std::collections::{HashMap, VecDeque};
+mod store;
+
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -34,6 +37,8 @@ use rustchat_core::{
 };
 use tokio::sync::{Mutex, broadcast};
 
+use crate::store::Store;
+
 /// A client gets this long to answer the challenge before being dropped.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often to probe an otherwise silent connection, and to check whether it
@@ -45,9 +50,9 @@ const RATE_PER_SEC: f64 = 5.0;
 const RATE_BURST: f64 = 10.0;
 /// Buffered broadcast messages before a slow client is considered hopeless.
 const BROADCAST_CAPACITY: usize = 256;
-/// How long an empty room keeps its replay buffer before being forgotten.
-/// Long enough to survive a reconnect or a quick restart, short enough that
-/// abandoned rooms don't accumulate.
+/// How long an empty room keeps its replay buffer in memory before being
+/// forgotten. With `--data-dir` its backlog stays on disk and is read back on
+/// the next join; without it, this is how long history survives at all.
 const EMPTY_ROOM_TTL: Duration = Duration::from_secs(600);
 /// How often to sweep for abandoned rooms.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
@@ -77,9 +82,29 @@ struct Args {
     auth_key: String,
 
     /// Sealed envelopes retained per room, for replay to clients that join
-    /// late. Memory only — a restart forgets everything. 0 disables replay.
+    /// late. 0 disables replay.
     #[arg(long, env = "RUSTCHAT_HISTORY", default_value_t = 200)]
     history: usize,
+
+    /// Directory to keep each room's sealed backlog in, so history survives a
+    /// restart and a room sitting empty — which is what lets another device
+    /// catch up later. Unset keeps history in memory only.
+    ///
+    /// Only ciphertext and room ids are written; nothing here can be read
+    /// without the room key.
+    #[arg(long, env = "RUSTCHAT_DATA_DIR")]
+    data_dir: Option<PathBuf>,
+
+    /// Days a room's saved backlog is kept after its last message.
+    #[arg(long, env = "RUSTCHAT_RETENTION_DAYS", default_value_t = 30)]
+    retention_days: u64,
+
+    /// Most rooms whose backlog is kept on disk. Past this, the rooms quiet
+    /// the longest are dropped first. Bounds disk use at roughly 512 KiB per
+    /// room, since the access key is shared and anyone holding it can open
+    /// rooms.
+    #[arg(long, env = "RUSTCHAT_MAX_STORED_ROOMS", default_value_t = 256)]
+    max_stored_rooms: usize,
 
     /// Maximum simultaneous connections across all rooms.
     #[arg(long, env = "RUSTCHAT_MAX_CONNS", default_value_t = 200)]
@@ -158,6 +183,9 @@ const REJECTION_REPORT_INTERVAL: Duration = Duration::from_secs(60);
 struct History {
     envelopes: VecDeque<SealedEnvelope>,
     bytes: usize,
+    /// Lines in this room's file on disk, which runs ahead of `envelopes`
+    /// between compactions.
+    on_disk: usize,
 }
 
 impl History {
@@ -187,6 +215,7 @@ fn envelope_bytes(env: &SealedEnvelope) -> usize {
 /// One room. The relay knows its id, how many sockets are in it, and a pile of
 /// bytes it cannot read.
 struct Room {
+    id: RoomId,
     tx: broadcast::Sender<Broadcast>,
     history: Mutex<History>,
     occupants: AtomicUsize,
@@ -195,11 +224,23 @@ struct Room {
 }
 
 impl Room {
-    fn new() -> Self {
+    /// A room, with whatever backlog was saved for it last time.
+    fn new(id: RoomId, store: Option<&Store>, history_limit: usize) -> Self {
         let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
+        let mut history = History::default();
+        if let Some(store) = store
+            && history_limit > 0
+        {
+            let saved = store.load(&id);
+            history.on_disk = saved.len();
+            for env in saved {
+                history.push(env, history_limit);
+            }
+        }
         Self {
+            id,
             tx,
-            history: Mutex::new(History::default()),
+            history: Mutex::new(history),
             occupants: AtomicUsize::new(0),
             idle_since: Mutex::new(Instant::now()),
         }
@@ -207,6 +248,31 @@ impl Room {
 
     fn occupants(&self) -> usize {
         self.occupants.load(Ordering::Relaxed)
+    }
+
+    /// Adds an envelope to the backlog, in memory and on disk if configured.
+    ///
+    /// A disk failure is logged and otherwise ignored: the room stays usable
+    /// live, it just won't remember this line across a restart.
+    async fn record(&self, env: &SealedEnvelope, state: &AppState) {
+        if state.history_limit == 0 {
+            return;
+        }
+        let mut history = self.history.lock().await;
+        history.push(env.clone(), state.history_limit);
+        let Some(store) = &state.store else { return };
+        // Append as a rule; once the file holds twice what memory keeps,
+        // rewrite it from memory so it can't grow without bound.
+        let result = if history.on_disk + 1 > history.envelopes.len() * 2 {
+            store
+                .rewrite(&self.id, &history.snapshot())
+                .map(|()| history.on_disk = history.envelopes.len())
+        } else {
+            store.append(&self.id, env).map(|()| history.on_disk += 1)
+        };
+        if let Err(err) = result {
+            eprintln!("could not save history to {}: {err}", store.dir().display());
+        }
     }
 }
 
@@ -218,6 +284,8 @@ struct AppState {
     max_conns: usize,
     max_rooms: usize,
     idle_timeout: Duration,
+    /// Where room backlogs are kept across restarts, if anywhere.
+    store: Option<Store>,
     /// Rejections are counted and reported periodically rather than logged
     /// one per line. Anything scanning a public address will knock constantly,
     /// and a line each drowns every event worth reading.
@@ -249,7 +317,7 @@ impl AppState {
                 return Err("this relay is holding too many rooms");
             }
         }
-        let room = Arc::new(Room::new());
+        let room = Arc::new(Room::new(id, self.store.as_ref(), self.history_limit));
         rooms.insert(id, room.clone());
         Ok(room)
     }
@@ -270,6 +338,19 @@ impl AppState {
         for id in stale {
             rooms.remove(&id);
         }
+
+        if let Some(store) = &self.store {
+            // Still under the rooms lock, so a room can't be read back from a
+            // file in the moment between deciding to delete it and doing so.
+            let live: HashSet<RoomId> = rooms.keys().copied().collect();
+            let removed = store.prune(&live);
+            if removed > 0 {
+                eprintln!(
+                    "dropped the saved history of {removed} room{} past retention",
+                    if removed == 1 { "" } else { "s" }
+                );
+            }
+        }
     }
 }
 
@@ -278,12 +359,36 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let auth_key = parse_hex32(&args.auth_key).context("--auth-key")?;
 
+    // An empty value (a blank line in the env file) means "not configured",
+    // not "the current directory".
+    let store = match args.data_dir.as_ref().filter(|d| !d.as_os_str().is_empty()) {
+        Some(dir) => Some(
+            Store::open(
+                dir,
+                Duration::from_secs(args.retention_days.saturating_mul(86_400)),
+                args.max_stored_rooms,
+            )
+            .context("--data-dir")?,
+        ),
+        None => None,
+    };
+    let persistence = match &store {
+        Some(store) => format!(
+            "saved in {} for {}d, up to {} rooms",
+            store.dir().display(),
+            args.retention_days,
+            args.max_stored_rooms
+        ),
+        None => "memory only".to_string(),
+    };
+
     let state = Arc::new(AppState {
         auth_key,
         history_limit: args.history,
         max_conns: args.max_conns,
         max_rooms: args.max_rooms,
         idle_timeout: Duration::from_secs(args.idle_timeout),
+        store,
         rejections: RejectionLog::new(REJECTION_REPORT_INTERVAL),
         rooms: Mutex::new(HashMap::new()),
         connections: AtomicUsize::new(0),
@@ -313,7 +418,7 @@ async fn main() -> Result<()> {
     let bound = listener.local_addr().context("reading the bound address")?;
     eprintln!(
         "rustchat-relay v{} listening on {bound} (protocol v{PROTOCOL_VERSION}, \
-         history {}/room, max conns {}, max rooms {}, idle timeout {}s)",
+         history {}/room ({persistence}), max conns {}, max rooms {}, idle timeout {}s)",
         env!("CARGO_PKG_VERSION"),
         args.history,
         args.max_conns,
@@ -509,7 +614,7 @@ async fn serve_socket(socket: WebSocket, state: Arc<AppState>) -> Result<()> {
                                 if envelope_bytes(&env) > MAX_ENVELOPE_BYTES {
                                     continue;
                                 }
-                                room.history.lock().await.push(env.clone(), state.history_limit);
+                                room.record(&env, &state).await;
                                 // Every client renders on receive, including
                                 // the sender, so the whole room agrees on
                                 // ordering without any sequence numbers.
@@ -829,6 +934,40 @@ mod tests {
         assert!(line.contains("1 unauthenticated connection in"), "{line}");
     }
 
+    #[tokio::test]
+    async fn a_room_reads_back_its_saved_backlog_and_compacts_it() {
+        let dir = std::env::temp_dir().join(format!(
+            "rustchat-relay-room-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let mut state = Arc::into_inner(test_state(4)).unwrap();
+        state.history_limit = 3;
+        state.store = Some(Store::open(&dir, Duration::from_secs(60), 8).unwrap());
+        let store = state.store.as_ref().unwrap();
+
+        let room = Room::new([7; 32], Some(store), 3);
+        for i in 0..20 {
+            room.record(&env("n", &i.to_string()), &state).await;
+        }
+        // The file never holds more than twice what memory keeps.
+        let on_disk = store.load(&[7; 32]);
+        assert!(on_disk.len() <= 6, "file grew to {} lines", on_disk.len());
+
+        // A fresh room — as after a restart — starts from the same place.
+        let reloaded = Room::new([7; 32], Some(store), 3);
+        let bodies: Vec<String> = reloaded
+            .history
+            .lock()
+            .await
+            .snapshot()
+            .into_iter()
+            .map(|e| e.c)
+            .collect();
+        assert_eq!(bodies, ["17", "18", "19"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn base64_roundtrips() {
         assert_eq!(unb64(&b64(b"hello")).unwrap(), b"hello");
@@ -841,6 +980,7 @@ mod tests {
             max_conns: 100,
             max_rooms,
             idle_timeout: Duration::from_secs(90),
+            store: None,
             rejections: RejectionLog::new(REJECTION_REPORT_INTERVAL),
             rooms: Mutex::new(HashMap::new()),
             connections: AtomicUsize::new(0),
