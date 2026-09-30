@@ -98,6 +98,27 @@ impl Payload {
     }
 }
 
+/// Exactly how many bytes `payload` will occupy on the wire once sealed and
+/// encoded, as the relay measures it against
+/// [`MAX_ENVELOPE_BYTES`](crate::MAX_ENVELOPE_BYTES).
+///
+/// Worth checking before sending: the relay drops an over-size envelope
+/// without a word, and JSON escaping means a body within
+/// [`MAX_BODY_BYTES`](crate::MAX_BODY_BYTES) can still seal too large — every
+/// quote, backslash or newline costs two bytes.
+pub fn envelope_size(payload: &Payload) -> usize {
+    let json = serde_json::to_vec(payload)
+        .map(|v| v.len())
+        .unwrap_or(usize::MAX / 2);
+    let b64 = |n: usize| n.div_ceil(3) * 4;
+    b64(crate::crypto::NONCE_BYTES) + b64(json + crate::crypto::TAG_BYTES)
+}
+
+/// Whether `payload` will fit through the relay.
+pub fn fits(payload: &Payload) -> bool {
+    envelope_size(payload) <= crate::MAX_ENVELOPE_BYTES
+}
+
 /// Current wall clock in Unix milliseconds, or 0 if the clock is before the
 /// epoch.
 pub fn now_ms() -> i64 {
@@ -127,12 +148,24 @@ pub fn sanitize_username(raw: &str) -> String {
     }
 }
 
-/// Strips a message body of anything that would break the TUI.
+/// Strips a message body of anything that would break the TUI, and caps it at
+/// [`MAX_BODY_BYTES`](crate::MAX_BODY_BYTES) on a character boundary.
+///
+/// The cap is in bytes because the relay's envelope cap is: a body capped in
+/// characters could be four times the size in emoji, seal to more than the
+/// relay accepts, and be dropped without anyone being told.
 pub fn sanitize_body(raw: &str) -> String {
-    raw.chars()
+    let mut out = String::new();
+    for c in raw
+        .chars()
         .filter(|c| (!c.is_control() || *c == '\n') && !is_bidi_control(*c))
-        .take(crate::MAX_BODY_BYTES)
-        .collect()
+    {
+        if out.len() + c.len_utf8() > crate::MAX_BODY_BYTES {
+            break;
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Unicode bidirectional overrides, which can visually reorder a line and make
@@ -179,6 +212,57 @@ mod tests {
         assert_eq!(sanitize_username("   "), "anon");
         assert_eq!(sanitize_username(&"x".repeat(100)).len(), 24);
         assert_eq!(sanitize_username("a\u{202e}b"), "ab");
+    }
+
+    #[test]
+    fn bodies_are_capped_in_bytes_not_characters() {
+        let emoji = "🦀".repeat(crate::MAX_BODY_BYTES);
+        let body = sanitize_body(&emoji);
+        assert!(body.len() <= crate::MAX_BODY_BYTES, "{} bytes", body.len());
+        assert_eq!(
+            body.len(),
+            crate::MAX_BODY_BYTES,
+            "4-byte chars fill it exactly"
+        );
+        assert!(body.chars().all(|c| c == '🦀'), "never cut mid-character");
+    }
+
+    fn sealed_size(payload: &Payload) -> usize {
+        use base64::Engine;
+        let json = serde_json::to_vec(payload).unwrap();
+        let (nonce, ct) = crate::seal(&[0u8; 32], &json).unwrap();
+        let b64 = base64::engine::general_purpose::STANDARD;
+        b64.encode(nonce).len() + b64.encode(ct).len()
+    }
+
+    #[test]
+    fn envelope_size_is_exact() {
+        for body in ["", "hi", "a\"b\\c\nd", &"🦀".repeat(300), &"x".repeat(4096)] {
+            let p = Payload::Msg {
+                user: "bmo".into(),
+                body: body.into(),
+                ts: 1_790_000_000_000,
+            };
+            assert_eq!(envelope_size(&p), sealed_size(&p), "body {body:?}");
+        }
+    }
+
+    #[test]
+    fn a_full_plain_body_fits_but_a_full_escaped_one_does_not() {
+        let plain = Payload::Msg {
+            user: "x".repeat(24),
+            body: sanitize_body(&"x".repeat(crate::MAX_BODY_BYTES)),
+            ts: i64::MAX,
+        };
+        assert!(fits(&plain), "{} bytes", envelope_size(&plain));
+        // Quotes are the worst case: one byte of body, two of JSON. This is
+        // what `fits` exists to catch, since the relay would drop it silently.
+        let escaped = Payload::Msg {
+            user: "x".into(),
+            body: sanitize_body(&"\"".repeat(crate::MAX_BODY_BYTES)),
+            ts: 0,
+        };
+        assert!(!fits(&escaped));
     }
 
     #[test]

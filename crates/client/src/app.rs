@@ -770,11 +770,24 @@ impl App {
         if body.is_empty() {
             return Action::None;
         }
-        Action::Send(Payload::Msg {
+        let payload = Payload::Msg {
             user: self.username.clone(),
             body,
             ts: proto::now_ms(),
-        })
+        };
+        // The relay would drop it without a word, so say so here — and hand
+        // the draft back rather than losing it.
+        if !proto::fits(&payload) || trimmed.len() > rustchat_core::MAX_BODY_BYTES {
+            self.cursor = raw.chars().count();
+            self.input = raw;
+            self.system(
+                "Too long to send — shorten it or split it up. (Quotes, backslashes and \
+                 line breaks count double.)",
+                Level::Bad,
+            );
+            return Action::None;
+        }
+        Action::Send(payload)
     }
 
     fn run_command(&mut self, rest: &str) -> Action {
@@ -1520,6 +1533,22 @@ mod tests {
         app.on_key(ctrl('f'));
         type_keys(&mut app, "SAM");
         assert_eq!(app.search_matches(), vec![0]);
+    }
+
+    #[test]
+    fn an_over_long_message_keeps_the_draft() {
+        let mut app = app();
+        let draft = "\"".repeat(rustchat_core::MAX_BODY_BYTES);
+        app.input = draft.clone();
+        assert_eq!(app.on_key(key(KeyCode::Enter)), Action::None, "not sent");
+        assert_eq!(app.input, draft, "and not lost");
+        assert!(matches!(
+            app.entries.last(),
+            Some(Entry::System {
+                level: Level::Bad,
+                ..
+            })
+        ));
     }
 
     #[test]
