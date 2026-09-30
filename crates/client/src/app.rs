@@ -5,8 +5,13 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use rustchat_core::identity::{PUBLIC_BYTES, fingerprint, fingerprint_matches};
 use rustchat_core::vault::{StoredLine, VaultData};
-use rustchat_core::{AccessKey, Invite, Payload, RoomKey, proto};
+use rustchat_core::{AccessKey, Invite, Payload, RoomKey, Signer, proto};
+
+use crate::net::Incoming;
+
+type PublicKey = [u8; PUBLIC_BYTES];
 
 /// Default relay, overridable at setup or with `--relay`.
 pub const DEFAULT_RELAY: &str = "wss://relay.bmo.guru/ws";
@@ -18,12 +23,14 @@ pub enum Entry {
         user: String,
         body: String,
         ts: i64,
-        /// Ours, so the UI can mark it. Nothing is authenticated here: any
-        /// room member can put any name on a message, so this is a display
-        /// nicety, not a claim about who sent what.
+        /// Sent by this device: signed with its key, so this one is a claim
+        /// that holds up — unlike the name, which anyone can type.
         own: bool,
         /// Addresses you by `@name`, so the UI can make it stand out.
         mention: bool,
+        trust: Trust,
+        /// The key that signed it, if any signature checked out.
+        key: Option<PublicKey>,
     },
     Presence {
         user: String,
@@ -43,6 +50,24 @@ pub enum Level {
     Good,
     Warn,
     Bad,
+}
+
+/// What a message's signature says about its sender, as the UI shows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Trust {
+    /// From this device.
+    Own,
+    /// Signed by a key you trust for that name.
+    Trusted,
+    /// Signed, but by a key you haven't trusted for that name: a new device,
+    /// or someone else using the name.
+    Unrecognised,
+    /// No signature — an older client. Could be anyone in the room.
+    Unsigned,
+    /// A signature that doesn't check out.
+    Forged,
+    /// Saved before messages were signed; nothing to go on.
+    Legacy,
 }
 
 /// Which incoming messages ring the bell and raise a desktop notification
@@ -243,6 +268,13 @@ pub struct App {
     pub alert: Option<String>,
     /// Set while searching; the input box edits the query instead.
     pub search: Option<Search>,
+    /// This device's public key, once there is one.
+    pub identity: Option<PublicKey>,
+    /// Keys seen signing for each name this session, so `/trust` can accept
+    /// one by its fingerprint.
+    seen_keys: std::collections::HashMap<String, Vec<PublicKey>>,
+    /// Warnings already shown, so an impostor doesn't bury the room in them.
+    warned: HashSet<(String, Option<PublicKey>)>,
 }
 
 impl App {
@@ -268,7 +300,101 @@ impl App {
             focused: None,
             alert: None,
             search: None,
+            identity: None,
+            seen_keys: Default::default(),
+            warned: HashSet::new(),
         }
+    }
+
+    /// Decides how far to trust a message under `user` with this signature.
+    ///
+    /// Trust on first use: the first key seen for a name is recorded and
+    /// trusted from then on, when `learn` is set. A different key under a
+    /// known name is not — that is the change worth noticing. Your own name
+    /// never learns a key this way, since anything signed as you by a key
+    /// other than this device's is exactly what should raise an eyebrow.
+    fn assess(&mut self, user: &str, signer: Signer, learn: bool) -> Trust {
+        let pk = match signer {
+            Signer::Unsigned => return Trust::Unsigned,
+            Signer::Invalid => return Trust::Forged,
+            Signer::Valid(pk) => pk,
+        };
+        let seen = self.seen_keys.entry(user.to_string()).or_default();
+        if !seen.contains(&pk) {
+            seen.push(pk);
+        }
+        if self.identity == Some(pk) {
+            return Trust::Own;
+        }
+        let encoded = b64(&pk);
+        match self.vault.known_keys.get_mut(user) {
+            Some(keys) if keys.contains(&encoded) => Trust::Trusted,
+            Some(_) => Trust::Unrecognised,
+            None if learn && user != self.username => {
+                self.vault
+                    .known_keys
+                    .insert(user.to_string(), vec![encoded]);
+                Trust::Trusted
+            }
+            None => Trust::Unrecognised,
+        }
+    }
+
+    /// Explains a suspicious signature, once per name and key per session.
+    fn warn_about(&mut self, user: &str, trust: Trust, key: Option<PublicKey>) {
+        if !matches!(trust, Trust::Unrecognised | Trust::Forged)
+            || !self.warned.insert((user.to_string(), key))
+        {
+            return;
+        }
+        let text = match (trust, key) {
+            (Trust::Unrecognised, Some(pk)) if user == self.username => format!(
+                "Something is being posted as {user} — your name — signed by a key that isn't \
+                 this device's ({fp}). If that's your other device, /trust {user} {fp}.",
+                fp = fingerprint(&pk)
+            ),
+            (Trust::Unrecognised, Some(pk)) => format!(
+                "{user} is signing with a key you haven't seen for that name ({fp}). If {user} \
+                 just started using a new device, check the fingerprint with them and \
+                 /trust {user} {fp} — otherwise someone else may be using the name.",
+                fp = fingerprint(&pk)
+            ),
+            _ => format!(
+                "A message claiming to be from {user} carries a signature that doesn't check \
+                 out. Treat it as forged."
+            ),
+        };
+        self.system(text, Level::Warn);
+    }
+
+    /// The trust recorded for a line saved to the vault, re-checked now.
+    fn stored_trust(&mut self, line: &StoredLine) -> (Trust, Option<PublicKey>) {
+        match line.signer.as_deref() {
+            None => (Trust::Legacy, None),
+            Some("unsigned") => (Trust::Unsigned, None),
+            Some("invalid") => (Trust::Forged, None),
+            Some(encoded) => match unb64_key(encoded) {
+                Some(pk) => (self.assess(&line.user, Signer::Valid(pk), false), Some(pk)),
+                None => (Trust::Legacy, None),
+            },
+        }
+    }
+
+    /// Remembers a chat line in the vault, with who signed it.
+    fn remember(&mut self, user: &str, body: &str, ts: i64, signer: Signer) {
+        if self.ephemeral {
+            return;
+        }
+        self.vault.push_line(StoredLine {
+            user: user.to_string(),
+            body: body.to_string(),
+            ts,
+            signer: Some(match signer {
+                Signer::Valid(pk) => b64(&pk),
+                Signer::Unsigned => "unsigned".into(),
+                Signer::Invalid => "invalid".into(),
+            }),
+        });
     }
 
     /// Indices into `entries` of every chat line matching the open search,
@@ -341,8 +467,17 @@ impl App {
     }
 
     /// Adds a chat line to the transcript, working out how to mark it.
-    fn push_msg(&mut self, user: String, body: String, ts: i64) {
-        let own = user == self.username;
+    fn push_msg(
+        &mut self,
+        user: String,
+        body: String,
+        ts: i64,
+        trust: Trust,
+        key: Option<PublicKey>,
+    ) {
+        // Only a line from before signing falls back on the name; an
+        // unsigned line under your name now is someone else's.
+        let own = trust == Trust::Own || (trust == Trust::Legacy && user == self.username);
         let mention = !own && mentions(&body, &self.username);
         self.entries.push(Entry::Msg {
             user,
@@ -350,13 +485,15 @@ impl App {
             ts,
             own,
             mention,
+            trust,
+            key,
         });
     }
 
     /// Decides whether a message that just arrived live deserves a
     /// notification. Never for replayed history, never for your own lines.
-    fn maybe_alert(&mut self, user: &str, body: &str) {
-        if user == self.username || self.focused == Some(true) {
+    fn maybe_alert(&mut self, user: &str, body: &str, own: bool) {
+        if own || self.focused == Some(true) {
             return;
         }
         let mention = mentions(body, &self.username);
@@ -386,20 +523,25 @@ impl App {
     }
 
     /// Records an incoming payload, remembering chat lines for next launch.
-    pub fn absorb(&mut self, payload: Payload, from_history: bool) {
+    pub fn absorb(&mut self, incoming: impl Into<Incoming>, from_history: bool) {
+        let Incoming { payload, signer } = incoming.into();
+        let trust = self.assess(payload.user(), signer, true);
+        let key = match signer {
+            Signer::Valid(pk) => Some(pk),
+            _ => None,
+        };
+        // Presence counts too: a join under a borrowed name is often the
+        // first sign of trouble.
+        if !from_history {
+            self.warn_about(payload.user(), trust, key);
+        }
         match payload {
             Payload::Msg { user, body, ts } => {
                 if !from_history {
-                    self.maybe_alert(&user, &body);
-                    if !self.ephemeral {
-                        self.vault.push_line(StoredLine {
-                            user: user.clone(),
-                            body: body.clone(),
-                            ts,
-                        });
-                    }
+                    self.maybe_alert(&user, &body, trust == Trust::Own);
+                    self.remember(&user, &body, ts, signer);
                 }
-                self.push_msg(user, body, ts);
+                self.push_msg(user, body, ts, trust, key);
             }
             // Presence is noise in a replayed backlog: "bmo joined" from two
             // hours ago tells you nothing about who is here now. Your own
@@ -431,7 +573,10 @@ impl App {
     /// before is shown. Those lines are also kept in the vault, which is what
     /// lets a device that first caught up from the relay keep that history
     /// once the relay has moved on.
-    pub fn absorb_backlog(&mut self, payloads: Vec<Payload>) {
+    pub fn absorb_backlog<I>(&mut self, payloads: impl IntoIterator<Item = I>)
+    where
+        I: Into<Incoming>,
+    {
         let mut seen: HashSet<(String, i64, String)> = self
             .entries
             .iter()
@@ -448,13 +593,14 @@ impl App {
             .collect();
         // Presence is dropped from a replay anyway (see `absorb`), and a line
         // identical in sender, millisecond and text is the same line.
-        let fresh: Vec<(String, String, i64)> = payloads
+        let fresh: Vec<(String, String, i64, Signer)> = payloads
             .into_iter()
-            .filter_map(|payload| match payload {
-                Payload::Msg { user, body, ts } => Some((user, body, ts)),
+            .map(Into::into)
+            .filter_map(|incoming| match incoming.payload {
+                Payload::Msg { user, body, ts } => Some((user, body, ts, incoming.signer)),
                 _ => None,
             })
-            .filter(|(user, body, ts)| seen.insert((user.clone(), *ts, body.clone())))
+            .filter(|(user, body, ts, _)| seen.insert((user.clone(), *ts, body.clone())))
             .collect();
         if fresh.is_empty() {
             return;
@@ -468,15 +614,15 @@ impl App {
             ),
             Level::Info,
         );
-        for (user, body, ts) in fresh {
-            if !self.ephemeral {
-                self.vault.push_line(StoredLine {
-                    user: user.clone(),
-                    body: body.clone(),
-                    ts,
-                });
-            }
-            self.push_msg(user, body, ts);
+        for (user, body, ts, signer) in fresh {
+            let trust = self.assess(&user, signer, true);
+            let key = match signer {
+                Signer::Valid(pk) => Some(pk),
+                _ => None,
+            };
+            self.warn_about(&user, trust, key);
+            self.remember(&user, &body, ts, signer);
+            self.push_msg(user, body, ts, trust, key);
         }
         self.trim();
     }
@@ -503,7 +649,8 @@ impl App {
             Level::Info,
         );
         for line in lines {
-            self.push_msg(line.user, line.body, line.ts);
+            let (trust, key) = self.stored_trust(&line);
+            self.push_msg(line.user, line.body, line.ts, trust, key);
         }
     }
 
@@ -804,6 +951,7 @@ impl App {
                 self.system(
                     "/invite one-paste invite · /key show the room key · /nick <name> rename \
                      · /who occupancy · /notify mentions|all|off · Ctrl-F search \
+                     · /whoami your key · /keys known keys · /trust <name> <fingerprint> \
                      · /clear wipe the view · /forget erase saved history · /quit",
                     Level::Info,
                 );
@@ -854,6 +1002,59 @@ impl App {
             }
             "clear" => {
                 self.entries.clear();
+                Action::None
+            }
+            "whoami" => {
+                match self.identity {
+                    Some(pk) => self.system(
+                        format!(
+                            "You're {}, signing as {}. Anyone can check that's really you by \
+                             comparing it with what their /keys shows for you.",
+                            self.username,
+                            fingerprint(&pk)
+                        ),
+                        Level::Info,
+                    ),
+                    None => self.system("No signing key yet.", Level::Bad),
+                }
+                Action::None
+            }
+            "keys" => {
+                let lines: Vec<String> = self
+                    .vault
+                    .known_keys
+                    .iter()
+                    .map(|(name, keys)| {
+                        let fps: Vec<String> = keys
+                            .iter()
+                            .filter_map(|k| unb64_key(k))
+                            .map(|pk| fingerprint(&pk))
+                            .collect();
+                        format!("{name}: {}", fps.join(", "))
+                    })
+                    .collect();
+                if lines.is_empty() {
+                    self.system(
+                        "No keys trusted yet. The first key seen for each name is trusted \
+                         automatically; a different one later is flagged.",
+                        Level::Info,
+                    );
+                } else {
+                    self.system(format!("Trusted keys — {}", lines.join(" · ")), Level::Info);
+                }
+                Action::None
+            }
+            "trust" | "untrust" => {
+                let mut words = arg.split_whitespace();
+                let (Some(name), fp) = (words.next(), words.collect::<Vec<_>>().join("")) else {
+                    self.system(format!("Usage: /{cmd} <name> <fingerprint>"), Level::Bad);
+                    return Action::None;
+                };
+                if cmd == "trust" {
+                    self.trust_key(name, &fp);
+                } else {
+                    self.untrust_key(name, &fp);
+                }
                 Action::None
             }
             "notify" => {
@@ -919,6 +1120,81 @@ impl App {
         }
     }
 
+    /// `/trust <name> <fingerprint>`: accepts a key seen for `name` this
+    /// session, and clears the warning from lines it already signed.
+    fn trust_key(&mut self, name: &str, fp: &str) {
+        let seen = self.seen_keys.get(name).cloned().unwrap_or_default();
+        let Some(pk) = seen.into_iter().find(|pk| fingerprint_matches(pk, fp)) else {
+            self.system(
+                format!(
+                    "No key matching that has signed as {name} this session. Copy the \
+                     fingerprint from the warning (at least the first 8 characters)."
+                ),
+                Level::Bad,
+            );
+            return;
+        };
+        let keys = self.vault.known_keys.entry(name.to_string()).or_default();
+        let encoded = b64(&pk);
+        if !keys.contains(&encoded) {
+            keys.push(encoded);
+        }
+        self.retrust(name, pk, Trust::Trusted);
+        self.system(
+            format!("Trusted {} for {name}.", fingerprint(&pk)),
+            Level::Good,
+        );
+    }
+
+    /// `/untrust <name> <fingerprint>`: stops trusting a key for a name.
+    fn untrust_key(&mut self, name: &str, fp: &str) {
+        let Some(keys) = self.vault.known_keys.get_mut(name) else {
+            self.system(format!("No trusted keys for {name}."), Level::Bad);
+            return;
+        };
+        let before = keys.len();
+        let mut dropped = None;
+        keys.retain(|k| match unb64_key(k) {
+            Some(pk) if fingerprint_matches(&pk, fp) => {
+                dropped = Some(pk);
+                false
+            }
+            _ => true,
+        });
+        if keys.is_empty() {
+            self.vault.known_keys.remove(name);
+        }
+        match dropped {
+            Some(pk) => {
+                self.retrust(name, pk, Trust::Unrecognised);
+                self.system(
+                    format!("No longer trusting {} for {name}.", fingerprint(&pk)),
+                    Level::Good,
+                );
+            }
+            None if before > 0 => self.system(
+                format!("No trusted key for {name} matches that."),
+                Level::Bad,
+            ),
+            None => self.system(format!("No trusted keys for {name}."), Level::Bad),
+        }
+    }
+
+    /// Re-marks lines already on screen from `name` signed by `pk`.
+    fn retrust(&mut self, name: &str, pk: PublicKey, to: Trust) {
+        for entry in &mut self.entries {
+            if let Entry::Msg {
+                user, key, trust, ..
+            } = entry
+                && user == name
+                && *key == Some(pk)
+                && *trust != Trust::Own
+            {
+                *trust = to;
+            }
+        }
+    }
+
     /// Seals the vault to disk. A no-op in ephemeral mode.
     pub fn save_vault(&mut self) -> Result<()> {
         if self.ephemeral || self.passphrase.is_empty() {
@@ -937,6 +1213,7 @@ impl Drop for App {
         self.passphrase.zeroize();
         self.vault.room_key_b64.zeroize();
         self.vault.access_key_b64.zeroize();
+        self.vault.identity_b64.zeroize();
     }
 }
 
@@ -1013,6 +1290,20 @@ fn ensure_path(host_and_path: &str) -> String {
     }
 }
 
+fn b64(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+fn unb64_key(s: &str) -> Option<PublicKey> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(s)
+        .ok()?
+        .try_into()
+        .ok()
+}
+
 /// Where `needle` first occurs in `hay` ignoring case, as a range of *char*
 /// indices. Char-wise rather than lowercasing whole strings, because
 /// lowercasing can change byte lengths and the UI needs positions that line
@@ -1069,7 +1360,20 @@ mod tests {
             true,
         );
         app.username = "bmo".into();
+        app.identity = Some(ME);
         app
+    }
+
+    /// This device's key in tests. The app never checks signatures itself —
+    /// the network layer does — so any bytes stand in for a key here.
+    const ME: PublicKey = [7; 32];
+
+    /// A payload as it arrives signed by `key`.
+    fn signed_by(key: PublicKey, payload: Payload) -> Incoming {
+        Incoming {
+            payload,
+            signer: Signer::Valid(key),
+        }
     }
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -1266,24 +1570,176 @@ mod tests {
     #[test]
     fn own_messages_are_marked() {
         let mut app = app();
-        app.absorb(
-            Payload::Msg {
-                user: "bmo".into(),
-                body: "a".into(),
-                ts: 0,
-            },
-            false,
-        );
-        app.absorb(
-            Payload::Msg {
-                user: "sam".into(),
-                body: "b".into(),
-                ts: 0,
-            },
-            false,
-        );
+        app.absorb(signed_by(ME, said("bmo", "a", 0)), false);
+        app.absorb(said("sam", "b", 0), false);
         assert!(matches!(app.entries[0], Entry::Msg { own: true, .. }));
         assert!(matches!(app.entries[1], Entry::Msg { own: false, .. }));
+    }
+
+    #[test]
+    fn your_name_alone_does_not_make_a_line_yours() {
+        // Unsigned, under your name: anyone in the room could have sent it.
+        let mut app = app();
+        app.absorb(said("bmo", "totally me", 0), false);
+        assert!(matches!(
+            app.entries.last(),
+            Some(Entry::Msg {
+                own: false,
+                trust: Trust::Unsigned,
+                ..
+            })
+        ));
+    }
+
+    fn trust_of_last(app: &App) -> Trust {
+        app.entries
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                Entry::Msg { trust, .. } => Some(*trust),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    fn warnings(app: &App) -> usize {
+        app.entries
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    Entry::System {
+                        level: Level::Warn,
+                        ..
+                    }
+                )
+            })
+            .count()
+    }
+
+    #[test]
+    fn the_first_key_for_a_name_is_trusted_and_a_new_one_flagged() {
+        let mut app = app();
+        let sam = [1; 32];
+        let impostor = [2; 32];
+        app.absorb(signed_by(sam, said("sam", "hi", 1)), false);
+        assert_eq!(trust_of_last(&app), Trust::Trusted);
+        assert_eq!(warnings(&app), 0, "first sight is quiet");
+
+        app.absorb(
+            signed_by(impostor, said("sam", "send me the key", 2)),
+            false,
+        );
+        assert_eq!(trust_of_last(&app), Trust::Unrecognised);
+        assert_eq!(warnings(&app), 1);
+
+        app.absorb(signed_by(impostor, said("sam", "hurry", 3)), false);
+        assert_eq!(warnings(&app), 1, "one warning per key, not per line");
+
+        app.absorb(signed_by(sam, said("sam", "that wasn't me", 4)), false);
+        assert_eq!(trust_of_last(&app), Trust::Trusted, "the real key still is");
+    }
+
+    #[test]
+    fn someone_else_signing_as_you_is_flagged() {
+        let mut app = app();
+        app.absorb(signed_by([3; 32], said("bmo", "it's me, honest", 1)), false);
+        assert_eq!(trust_of_last(&app), Trust::Unrecognised);
+        assert!(
+            !app.vault.known_keys.contains_key("bmo"),
+            "your own name never learns a key on first sight"
+        );
+        let warning = app
+            .entries
+            .iter()
+            .find_map(|e| match e {
+                Entry::System {
+                    body,
+                    level: Level::Warn,
+                } => Some(body.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(warning.contains("your name"), "{warning}");
+    }
+
+    #[test]
+    fn a_bad_signature_is_marked_forged() {
+        let mut app = app();
+        app.absorb(
+            Incoming {
+                payload: said("sam", "hi", 1),
+                signer: Signer::Invalid,
+            },
+            false,
+        );
+        assert_eq!(trust_of_last(&app), Trust::Forged);
+        assert_eq!(warnings(&app), 1);
+    }
+
+    #[test]
+    fn trusting_a_key_clears_its_lines_and_sticks() {
+        let mut app = app();
+        let old = [1; 32];
+        let new_device = [2; 32];
+        app.absorb(signed_by(old, said("sam", "laptop", 1)), false);
+        app.absorb(signed_by(new_device, said("sam", "phone", 2)), false);
+        assert_eq!(trust_of_last(&app), Trust::Unrecognised);
+
+        let fp = fingerprint(&new_device);
+        app.run_command(&format!("trust sam {}", &fp[..9]));
+        assert_eq!(
+            trust_of_last(&app),
+            Trust::Trusted,
+            "already-shown line updated"
+        );
+        app.absorb(signed_by(new_device, said("sam", "phone again", 3)), false);
+        assert_eq!(trust_of_last(&app), Trust::Trusted);
+        assert_eq!(app.vault.known_keys["sam"].len(), 2, "both devices now");
+
+        app.run_command(&format!("untrust sam {fp}"));
+        assert_eq!(trust_of_last(&app), Trust::Unrecognised);
+        assert_eq!(app.vault.known_keys["sam"].len(), 1);
+    }
+
+    #[test]
+    fn trust_needs_a_key_actually_seen() {
+        let mut app = app();
+        app.run_command("trust sam 0000 0000 0000 0000");
+        assert!(!app.vault.known_keys.contains_key("sam"));
+        assert!(matches!(
+            app.entries.last(),
+            Some(Entry::System {
+                level: Level::Bad,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn saved_lines_are_rechecked_on_load() {
+        // An impostor's line must not come back from disk looking clean.
+        let mut first = app();
+        first.ephemeral = false;
+        first.absorb(signed_by([1; 32], said("sam", "real", 1)), false);
+        first.absorb(signed_by([2; 32], said("sam", "fake", 2)), false);
+        first.absorb(said("alex", "old client", 3), false);
+
+        let mut reopened = app();
+        reopened.vault = first.vault.clone();
+        reopened.load_history();
+        let trusts: Vec<Trust> = reopened
+            .entries
+            .iter()
+            .filter_map(|e| match e {
+                Entry::Msg { trust, .. } => Some(*trust),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            trusts,
+            [Trust::Trusted, Trust::Unrecognised, Trust::Unsigned]
+        );
     }
 
     #[test]
@@ -1383,6 +1839,7 @@ mod tests {
             user: "sam".into(),
             body: "old".into(),
             ts: 1,
+            signer: None,
         });
         app.load_history();
         app.absorb_backlog(vec![said("sam", "old", 1), said("sam", "new", 2)]);
@@ -1442,7 +1899,10 @@ mod tests {
         app.absorb(said("sam", "@bmo from before", 2), true);
         assert!(app.alert.is_none(), "replayed history never alerts");
 
-        app.absorb(said("bmo", "@bmo talking to myself", 3), false);
+        app.absorb(
+            signed_by(ME, said("bmo", "@bmo talking to myself", 3)),
+            false,
+        );
         assert!(app.alert.is_none(), "your own lines never alert");
 
         app.focused = Some(true);
@@ -1558,6 +2018,7 @@ mod tests {
             user: "sam".into(),
             body: "older".into(),
             ts: 1,
+            signer: None,
         });
         app.load_history();
         assert!(

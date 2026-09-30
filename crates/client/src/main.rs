@@ -22,7 +22,7 @@ use crossterm::event::{Event, EventStream, KeyEventKind};
 use futures_util::StreamExt;
 use net::{NetCmd, NetEvent};
 use rustchat_core::vault::{VaultData, open_vault, seal_vault};
-use rustchat_core::{AccessKey, Invite, Payload, RoomKey, proto};
+use rustchat_core::{AccessKey, Identity, Invite, Payload, RoomKey, proto};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -72,6 +72,13 @@ struct Cli {
     /// Path to the vault file.
     #[arg(long, global = true)]
     vault: Option<PathBuf>,
+
+    /// Sign as this identity (`rcid1-…`, from `rustchat identity`) instead of
+    /// the vault's — or instead of a throwaway one, when there's no vault.
+    ///
+    /// Prefer the `RUSTCHAT_IDENTITY` environment variable; it's a secret.
+    #[arg(long, env = "RUSTCHAT_IDENTITY", hide_env_values = true, global = true)]
+    identity: Option<String>,
 
     /// Don't check GitHub for a newer release on launch.
     #[arg(long, env = update::OPT_OUT_ENV)]
@@ -127,6 +134,11 @@ enum Command {
         #[arg(long)]
         no_history: bool,
     },
+    /// Generate a signing identity for a bot or script, to keep in
+    /// RUSTCHAT_IDENTITY so it's recognised across runs.
+    ///
+    /// Interactive use doesn't need this: your vault holds your identity.
+    Identity,
     /// Print where the vault lives.
     Where,
     /// Delete the vault. The room itself is unaffected.
@@ -138,6 +150,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Some(Command::Keygen) => keygen(),
+        Some(Command::Identity) => identity(),
         Some(Command::Relaykey) => relaykey(),
         Some(Command::Authkey { ref access_key }) => authkey(access_key.as_deref()),
         Some(Command::Invite {
@@ -196,6 +209,24 @@ fn keygen() -> Result<()> {
     println!();
     println!("People also need the relay's access key. `rustchat invite` bundles both");
     println!("with the relay address into a single value to paste.");
+    Ok(())
+}
+
+/// Prints a fresh signing identity for unattended use.
+fn identity() -> Result<()> {
+    let id = Identity::generate();
+    println!("Identity      {}", id.encode());
+    println!(
+        "Fingerprint   {}",
+        rustchat_core::identity::fingerprint(&id.public())
+    );
+    println!();
+    println!("For a bot or script that runs without a vault. Set it as");
+    println!("RUSTCHAT_IDENTITY wherever the bot runs, and the room will recognise");
+    println!("its messages as coming from the same sender every time. Without it,");
+    println!("each run signs with a throwaway key and gets flagged as unrecognised.");
+    println!();
+    println!("It's a secret: anyone holding it can sign as that bot.");
     Ok(())
 }
 
@@ -317,6 +348,7 @@ async fn chat(cli: Cli) -> Result<()> {
 
     let mut pending = None;
     if let Some((conn, room_key, access_key)) = direct_conn {
+        app.identity = Some(conn.identity.public());
         app.relay = conn.relay_url.clone();
         app.username = proto::sanitize_username(cli.username.as_deref().unwrap_or("anon"));
         app.room_key_display = Some(room_key.encode());
@@ -368,6 +400,7 @@ fn resolve_direct(cli: &Cli, relay_hint: &str) -> Result<Option<Direct>> {
             relay_url,
             access: AccessKey::from_bytes(*invite.access_key.as_bytes()),
             room: room.derive(),
+            identity: cli_identity(cli)?.unwrap_or_else(Identity::generate),
         };
         return Ok(Some((conn, room, invite.access_key)));
     }
@@ -386,8 +419,34 @@ fn resolve_direct(cli: &Cli, relay_hint: &str) -> Result<Option<Direct>> {
         relay_url: app::normalize_relay(relay_hint).map_err(|e| anyhow::anyhow!(e))?,
         access: AccessKey::from_bytes(*access.as_bytes()),
         room: room.derive(),
+        identity: cli_identity(cli)?.unwrap_or_else(Identity::generate),
     };
     Ok(Some((conn, room, access)))
+}
+
+/// `--identity` / `RUSTCHAT_IDENTITY`, if given.
+fn cli_identity(cli: &Cli) -> Result<Option<Identity>> {
+    cli.identity
+        .as_deref()
+        .map(|raw| Identity::decode(raw).context("--identity / RUSTCHAT_IDENTITY"))
+        .transpose()
+}
+
+/// The vault's identity, creating one in a vault from before identities
+/// existed. `--identity` wins for the session without replacing it.
+fn vault_identity(cli: &Cli, data: &mut VaultData) -> Result<Identity> {
+    if let Some(id) = cli_identity(cli)? {
+        return Ok(id);
+    }
+    if data.identity_b64.is_empty() {
+        let id = Identity::generate();
+        data.identity_b64 = encode_b64(&id.to_bytes());
+        return Ok(id);
+    }
+    Ok(Identity::from_bytes(&decode_b64(
+        &data.identity_b64,
+        "identity",
+    )?))
 }
 
 async fn run(
@@ -643,6 +702,9 @@ async fn do_unlock(
         return Ok(());
     }
     let access = decode_access_key(&data.access_key_b64)?;
+    let mut data = data;
+    let identity = vault_identity(cli, &mut data)?;
+    app.identity = Some(identity.public());
     app.passphrase = passphrase;
     app.username = proto::sanitize_username(cli.username.as_deref().unwrap_or(
         if data.username.is_empty() {
@@ -675,6 +737,7 @@ async fn do_unlock(
         relay_url: app.relay.clone(),
         access,
         room: key.derive(),
+        identity,
     });
     *net_tx = Some(tx);
     *net_rx = Some(rx);
@@ -706,6 +769,7 @@ async fn do_finish_setup(
     };
 
     let passphrase = setup.passphrase.clone();
+    let identity = Identity::generate();
     let data = VaultData {
         room_key_b64: encode_b64(room_key.as_bytes()),
         access_key_b64: encode_b64(access_key.as_bytes()),
@@ -713,11 +777,15 @@ async fn do_finish_setup(
         username: setup.username.clone(),
         history: Vec::new(),
         notify: String::new(),
+        identity_b64: encode_b64(&identity.to_bytes()),
+        known_keys: Default::default(),
     };
+    let identity_public = identity.public();
     let conn = net::Connection {
         relay_url: setup.relay.clone(),
         access: AccessKey::from_bytes(*access_key.as_bytes()),
         room: room_key.derive(),
+        identity,
     };
     let key_display = room_key.encode();
     let invite_display = Invite {
@@ -741,6 +809,7 @@ async fn do_finish_setup(
 
     app.passphrase = passphrase;
     app.vault = data;
+    app.identity = Some(identity_public);
     app.username = username;
     app.relay = relay;
     app.room_key_display = Some(key_display);
@@ -867,6 +936,7 @@ mod tests {
             username: None,
             no_vault: true,
             vault: None,
+            identity: None,
             no_update_check: true,
             command: None,
         };
@@ -892,6 +962,7 @@ mod tests {
             username: None,
             no_vault: true,
             vault: None,
+            identity: None,
             no_update_check: true,
             command: None,
         };
@@ -918,6 +989,7 @@ mod tests {
             username: None,
             no_vault: true,
             vault: None,
+            identity: None,
             no_update_check: true,
             command: None,
         };
@@ -943,6 +1015,7 @@ mod tests {
             username: None,
             no_vault: true,
             vault: None,
+            identity: None,
             no_update_check: true,
             command: None,
         };

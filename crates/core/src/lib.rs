@@ -17,12 +17,14 @@
 //! somebody in one paste.
 
 pub mod crypto;
+pub mod identity;
 pub mod invite;
 pub mod key;
 pub mod proto;
 pub mod vault;
 
 pub use crypto::{open, seal};
+pub use identity::{Identity, Signed, Signer};
 pub use invite::Invite;
 pub use key::{AccessKey, RoomKey, RoomKeys, parse_hex32, verify_proof};
 pub use proto::{ClientMsg, Payload, RelayMsg, SealedEnvelope};
