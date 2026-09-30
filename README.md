@@ -65,8 +65,10 @@ Keeping these straight is most of understanding rustchat.
 | If it leaks | strangers can use your relay | that room is readable | your local vault is readable |
 
 The **room key** is the only thing protecting what people say. There are no
-accounts and no server-side identity; usernames are picked client-side and
-nobody verifies them, so two people can both be `sam`.
+accounts and no server-side identity; usernames are picked client-side, so two
+people can both call themselves `sam`. What stops that from being quietly
+useful is that every device signs what it sends — see
+[Who said that?](#who-said-that).
 
 The **relay access key** exists so your relay isn't a free service for the
 internet. It says nothing about which rooms exist or what is in them — a relay
@@ -173,6 +175,10 @@ Type to talk. Enter sends.
 | `/invite` | one-paste invite for this room |
 | `/key` | show just the room key |
 | `/nick <name>` | change your name |
+| `/whoami` | your signing key's fingerprint |
+| `/keys` | the keys you trust, per name |
+| `/trust <name> <fingerprint>` | accept a new key for a name (e.g. their new phone) |
+| `/untrust <name> <fingerprint>` | stop trusting one |
 | `/who` | how many connections are in the room |
 | `/notify mentions\|all\|off` | when to ring and notify (default: `@you` only) |
 | `/clear` | wipe the view |
@@ -253,6 +259,41 @@ rustchat keygen        # for reference: every key gives a different room
 Easiest fix is to have them send you an `/invite`, which cannot disagree about
 which room it means.
 
+## Who said that?
+
+Each device has its own signing key (Ed25519), made on first run and kept in
+your vault, and signs everything it sends. Nobody hands these keys out or
+vouches for them. Instead, the first key seen for a name is remembered, the
+way SSH remembers a server, and every later message under that name is checked
+against it:
+
+| Beside the name | Meaning |
+|---|---|
+| *(nothing)* | signed by a key you trust for that name |
+| `⚠ unrecognised key` | signed, but by a different key than before |
+| `· unsigned` | from an older client that doesn't sign |
+| `✗ bad signature` | the signature doesn't check out — treat it as forged |
+
+An unrecognised key is either someone's new device or someone else using the
+name, and only the person themselves can tell you which. Ask them to run
+`/whoami`, compare the fingerprint over something you already trust, and if it
+matches, `/trust <name> <fingerprint>`. Your own name is never trusted on
+first sight, so anything posted as you from a key that isn't this device's is
+flagged — including your own second device, until you `/trust` it.
+
+This can't catch an impostor who was there *first*, and it can't stop someone
+from posting under a name nobody has used yet. What it does is make a change
+visible, which is the attack that matters in a room of people who already
+know each other.
+
+A bot running without a vault would get a fresh key every run and be flagged
+every time. Give it a lasting one:
+
+```sh
+rustchat identity                                  # prints an rcid1-… identity
+RUSTCHAT_IDENTITY=rcid1-… rustchat send -u ci "deploy finished"
+```
+
 ## How it works
 
 ```
@@ -309,9 +350,13 @@ Worth being straight about:
   directory, a copy of that buffer on the relay's disk for up to 30 days.
   Rotating means a new key and telling everyone — but not touching the relay.
 - **A leaked invite.** It contains both keys. Treat it like the room key.
-- **Impersonation inside the room.** Names aren't authenticated. If you're in
-  the room, you can send as anyone. The key gets you in the door; it doesn't
-  distinguish people once inside.
+- **Impersonation by whoever got there first.** Signing makes a *change* of
+  key under a name visible, but the first key seen for a name is trusted on
+  sight. Compare fingerprints with `/whoami` if it matters. Messages from
+  older clients are unsigned and can't be checked at all.
+- **Replay inside the room.** A room member can re-send someone's earlier
+  signed message; it verifies, because it's genuine. Its timestamp gives it
+  away, but nothing stops it.
 - **Traffic analysis.** The relay sees who connects from where, when, which
   room id they joined, and how big each message is. Room ids are stable, so it
   can tell that the same room is being used again — just not what's in it.

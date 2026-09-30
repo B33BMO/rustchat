@@ -58,7 +58,7 @@ fn stretch(passphrase: &str, domain: &str) -> Result<[u8; 32]> {
 }
 
 /// Encodes 32 bytes as `<prefix>-XXXXXXXX-...`, grouped for reading aloud.
-fn encode_with(prefix: &str, bytes: &[u8; 32]) -> String {
+pub(crate) fn encode_with(prefix: &str, bytes: &[u8; 32]) -> String {
     let body = BASE32_NOPAD.encode(bytes);
     let mut out = String::with_capacity(prefix.len() + body.len() + 8);
     out.push_str(prefix);
@@ -72,7 +72,7 @@ fn encode_with(prefix: &str, bytes: &[u8; 32]) -> String {
 }
 
 /// Parses [`encode_with`] output, tolerating case, dashes and whitespace.
-fn decode_with(prefix: &str, s: &str) -> Result<[u8; 32]> {
+pub(crate) fn decode_with(prefix: &str, s: &str) -> Result<[u8; 32]> {
     let cleaned: String = s
         .chars()
         .filter(|c| !c.is_whitespace() && *c != '-' && *c != '_')

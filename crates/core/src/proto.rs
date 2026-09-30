@@ -106,17 +106,32 @@ impl Payload {
 /// without a word, and JSON escaping means a body within
 /// [`MAX_BODY_BYTES`](crate::MAX_BODY_BYTES) can still seal too large — every
 /// quote, backslash or newline costs two bytes.
-pub fn envelope_size(payload: &Payload) -> usize {
-    let json = serde_json::to_vec(payload)
+pub fn envelope_size(sealed: &impl Serialize) -> usize {
+    let json = serde_json::to_vec(sealed)
         .map(|v| v.len())
         .unwrap_or(usize::MAX / 2);
     let b64 = |n: usize| n.div_ceil(3) * 4;
     b64(crate::crypto::NONCE_BYTES) + b64(json + crate::crypto::TAG_BYTES)
 }
 
-/// Whether `payload` will fit through the relay.
+/// Whether `payload` will fit through the relay once signed.
 pub fn fits(payload: &Payload) -> bool {
-    envelope_size(payload) <= crate::MAX_ENVELOPE_BYTES
+    signed_size(payload) <= crate::MAX_ENVELOPE_BYTES
+}
+
+/// [`envelope_size`] of `payload` with a signature attached — the size that
+/// actually goes out. Signatures are fixed-size, so a placeholder of the right
+/// length measures exactly.
+pub fn signed_size(payload: &Payload) -> usize {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    envelope_size(&crate::Signed {
+        payload: payload.clone(),
+        sig: Some(crate::identity::Sig {
+            pk: b64.encode([0u8; crate::identity::PUBLIC_BYTES]),
+            s: b64.encode([0u8; crate::identity::SIGNATURE_BYTES]),
+        }),
+    })
 }
 
 /// Current wall clock in Unix milliseconds, or 0 if the clock is before the
@@ -248,13 +263,28 @@ mod tests {
     }
 
     #[test]
+    fn signed_size_is_exact() {
+        let id = crate::Identity::generate();
+        let payload = Payload::Msg {
+            user: "bmo".into(),
+            body: "a \"quoted\" line".into(),
+            ts: 7,
+        };
+        let signed = crate::Signed {
+            sig: Some(id.sign(&[1; 32], &payload)),
+            payload: payload.clone(),
+        };
+        assert_eq!(signed_size(&payload), envelope_size(&signed));
+    }
+
+    #[test]
     fn a_full_plain_body_fits_but_a_full_escaped_one_does_not() {
         let plain = Payload::Msg {
             user: "x".repeat(24),
             body: sanitize_body(&"x".repeat(crate::MAX_BODY_BYTES)),
             ts: i64::MAX,
         };
-        assert!(fits(&plain), "{} bytes", envelope_size(&plain));
+        assert!(fits(&plain), "{} bytes", signed_size(&plain));
         // Quotes are the worst case: one byte of body, two of JSON. This is
         // what `fits` exists to catch, since the relay would drop it silently.
         let escaped = Payload::Msg {

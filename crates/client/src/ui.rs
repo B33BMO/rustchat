@@ -6,7 +6,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
 
-use crate::app::{App, Entry, Level, Screen, Setup, Status, Step, Unlock, find_ci};
+use crate::app::{App, Entry, Level, Screen, Setup, Status, Step, Trust, Unlock, find_ci};
 
 // A small, deliberate palette. The terminal's own background is left alone so
 // rustchat sits inside whatever theme someone already likes.
@@ -163,9 +163,12 @@ fn build_transcript(app: &App, width: usize) -> (Vec<Line<'static>>, Vec<usize>)
         .map(|s| s.query.as_str())
         .filter(|q| !q.is_empty());
     let focus = app.search_focus();
-    // Consecutive messages from one person share a single name header, which
+    // Consecutive messages from one sender share a single name header, which
     // keeps a back-and-forth readable without repeating the name every line.
-    let mut last_speaker: Option<String> = None;
+    // A sender is a name *and* a key: grouping on the name alone would tuck an
+    // impostor's line under the real person's header, unmarked.
+    type Speaker = (String, Option<[u8; 32]>, Trust);
+    let mut last_speaker: Option<Speaker> = None;
 
     for (index, entry) in app.entries.iter().enumerate() {
         starts.push(out.len());
@@ -176,8 +179,11 @@ fn build_transcript(app: &App, width: usize) -> (Vec<Line<'static>>, Vec<usize>)
                 ts,
                 own,
                 mention,
+                trust,
+                key,
             } => {
-                if last_speaker.as_deref() != Some(user.as_str()) {
+                let speaker = (user.clone(), *key, *trust);
+                if last_speaker.as_ref() != Some(&speaker) {
                     if !out.is_empty() {
                         out.push(Line::default());
                     }
@@ -189,12 +195,15 @@ fn build_transcript(app: &App, width: usize) -> (Vec<Line<'static>>, Vec<usize>)
                     if *own {
                         spans.push(Span::styled(" (you)", Style::default().fg(DIM)));
                     }
+                    if let Some(mark) = trust_mark(*trust, *key) {
+                        spans.push(mark);
+                    }
                     spans.push(Span::styled(
                         format!("  {}", clock(*ts)),
                         Style::default().fg(DIM),
                     ));
                     out.push(Line::from(spans));
-                    last_speaker = Some(user.clone());
+                    last_speaker = Some(speaker);
                 }
                 // A mention gets a bar down its left edge, so it can be found
                 // again at a glance when scrolling back.
@@ -250,6 +259,29 @@ fn build_transcript(app: &App, width: usize) -> (Vec<Line<'static>>, Vec<usize>)
         }
     }
     (out, starts)
+}
+
+/// What to say beside a name about the signature under it. Trusted and own
+/// lines say nothing: the marks are for what deserves a second look.
+fn trust_mark(trust: Trust, key: Option<[u8; 32]>) -> Option<Span<'static>> {
+    let (text, color) = match trust {
+        Trust::Own | Trust::Trusted | Trust::Legacy => return None,
+        Trust::Unsigned => (" · unsigned".to_string(), DIM),
+        Trust::Unrecognised => {
+            // The first group of the fingerprint, to tell two unknown keys
+            // apart at a glance; /keys and the warning carry the whole thing.
+            let short = key
+                .map(|pk| rustchat_core::identity::fingerprint(&pk))
+                .and_then(|fp| fp.split(' ').next().map(str::to_string))
+                .unwrap_or_default();
+            (format!(" ⚠ unrecognised key {short}"), WARN)
+        }
+        Trust::Forged => (" ✗ bad signature".to_string(), BAD),
+    };
+    Some(Span::styled(
+        text,
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    ))
 }
 
 /// Splits `text` into spans with every occurrence of `query` marked. The
@@ -845,6 +877,44 @@ mod tests {
             "the match scrolls into view"
         );
         assert!(shown.contains("1 of 1"), "and the count shows");
+    }
+
+    #[test]
+    fn an_impostor_never_shares_the_real_senders_header() {
+        use crate::net::Incoming;
+        use rustchat_core::{Payload, Signer};
+
+        let mut app = App::new(
+            std::path::PathBuf::from("/tmp/nope"),
+            Screen::Chat,
+            "wss://x/ws".into(),
+            true,
+        );
+        app.username = "bmo".into();
+        let line = |key: u8, body: &str| Incoming {
+            payload: Payload::Msg {
+                user: "sam".into(),
+                body: body.into(),
+                ts: 0,
+            },
+            signer: Signer::Valid([key; 32]),
+        };
+        app.absorb(line(1, "real one"), false);
+        app.absorb(line(2, "fake one"), false);
+
+        let (lines, _) = build_transcript(&app, 80);
+        let text: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        let headers: Vec<&String> = text.iter().filter(|l| l.starts_with("sam")).collect();
+        assert_eq!(
+            headers.len(),
+            2,
+            "a second header for the second key: {text:#?}"
+        );
+        assert!(!headers[0].contains('⚠'));
+        assert!(headers[1].contains("⚠ unrecognised key"), "{}", headers[1]);
     }
 
     #[test]

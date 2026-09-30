@@ -9,7 +9,8 @@ use std::time::Duration;
 use anyhow::{Result, bail};
 use futures_util::{SinkExt, StreamExt};
 use rustchat_core::{
-    AccessKey, ClientMsg, PROTOCOL_VERSION, Payload, RelayMsg, RoomKeys, SealedEnvelope, open, seal,
+    AccessKey, ClientMsg, Identity, PROTOCOL_VERSION, Payload, RelayMsg, RoomKeys, SealedEnvelope,
+    Signed, Signer, open, seal,
 };
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
@@ -18,6 +19,23 @@ use tokio_tungstenite::tungstenite::Message;
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// How often to nudge the relay so idle connections aren't reaped.
 const KEEPALIVE: Duration = Duration::from_secs(30);
+
+/// A payload that opened, and what its signature says about who sent it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Incoming {
+    pub payload: Payload,
+    pub signer: Signer,
+}
+
+impl From<Payload> for Incoming {
+    /// A payload with no signature, as an older client sends.
+    fn from(payload: Payload) -> Self {
+        Self {
+            payload,
+            signer: Signer::Unsigned,
+        }
+    }
+}
 
 /// Something happened on the wire that the UI should show.
 #[derive(Debug)]
@@ -30,9 +48,9 @@ pub enum NetEvent {
         occupants: usize,
     },
     /// Replayed backlog, oldest first.
-    History(Vec<Payload>),
+    History(Vec<Incoming>),
     /// A payload that opened cleanly.
-    Payload(Payload),
+    Payload(Incoming),
     Occupants(usize),
     /// An informational line for the transcript.
     Notice(String),
@@ -67,6 +85,8 @@ pub struct Connection {
     pub relay_url: String,
     pub access: AccessKey,
     pub room: RoomKeys,
+    /// Signs everything this connection sends.
+    pub identity: Identity,
 }
 
 impl std::fmt::Debug for Connection {
@@ -203,7 +223,7 @@ async fn session(
                         }
                     }
                     RelayMsg::History { envs } => {
-                        let payloads: Vec<Payload> = envs
+                        let payloads: Vec<Incoming> = envs
                             .iter()
                             .filter_map(|env| open_envelope(&conn.room, env))
                             .collect();
@@ -236,7 +256,11 @@ async fn session(
                             .await;
                         continue;
                     }
-                    let json = serde_json::to_vec(&payload)?;
+                    let signed = Signed {
+                        sig: Some(conn.identity.sign(&conn.room.room_id, &payload)),
+                        payload,
+                    };
+                    let json = serde_json::to_vec(&signed)?;
                     let (nonce, ciphertext) = seal(&conn.room.msg, &json)?;
                     send(&mut sink, &ClientMsg::Send {
                         env: SealedEnvelope { n: b64(&nonce), c: b64(&ciphertext) },
@@ -260,11 +284,15 @@ async fn session(
 /// A relay's history can legitimately contain messages from a *previous* room
 /// key — someone rotated it, the relay kept its buffer — so a failure here is
 /// mundane and gets skipped quietly rather than reported as an error.
-fn open_envelope(room: &RoomKeys, env: &SealedEnvelope) -> Option<Payload> {
+fn open_envelope(room: &RoomKeys, env: &SealedEnvelope) -> Option<Incoming> {
     let nonce = unb64(&env.n).ok()?;
     let ciphertext = unb64(&env.c).ok()?;
     let plaintext = open(&room.msg, &nonce, &ciphertext).ok()?;
-    serde_json::from_slice(&plaintext).ok()
+    let signed: Signed = serde_json::from_slice(&plaintext).ok()?;
+    Some(Incoming {
+        signer: signed.verify(&room.room_id),
+        payload: signed.payload,
+    })
 }
 
 fn to_hex(bytes: &[u8; 32]) -> String {
@@ -329,8 +357,33 @@ mod tests {
             c: b64(&ct),
         };
         let back = open_envelope(&keys, &env).unwrap();
-        assert_eq!(back.user(), "bmo");
-        assert_eq!(back.ts(), 99);
+        assert_eq!(back.payload.user(), "bmo");
+        assert_eq!(back.payload.ts(), 99);
+        assert_eq!(back.signer, Signer::Unsigned, "an older client's message");
+    }
+
+    #[test]
+    fn signed_envelopes_open_with_their_signer() {
+        let keys = RoomKey::generate().derive();
+        let id = Identity::generate();
+        let payload = Payload::Msg {
+            user: "bmo".into(),
+            body: "hello".into(),
+            ts: 99,
+        };
+        let signed = Signed {
+            sig: Some(id.sign(&keys.room_id, &payload)),
+            payload,
+        };
+        let (nonce, ct) = seal(&keys.msg, &serde_json::to_vec(&signed).unwrap()).unwrap();
+        let env = SealedEnvelope {
+            n: b64(&nonce),
+            c: b64(&ct),
+        };
+        assert_eq!(
+            open_envelope(&keys, &env).unwrap().signer,
+            Signer::Valid(id.public())
+        );
     }
 
     #[test]
@@ -358,6 +411,7 @@ mod tests {
             relay_url: "wss://relay.example/ws".into(),
             access: rustchat_core::AccessKey::from_bytes(*access.as_bytes()),
             room: room.derive(),
+            identity: Identity::generate(),
         };
         let shown = format!("{conn:?}");
         assert!(shown.contains("<redacted>"));

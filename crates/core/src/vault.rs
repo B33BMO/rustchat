@@ -37,6 +37,12 @@ pub struct StoredLine {
     pub user: String,
     pub body: String,
     pub ts: i64,
+    /// Who signed it: a base64 public key, `"unsigned"` or `"invalid"`.
+    /// Absent on lines saved before messages were signed. Kept so that a line
+    /// is re-checked against the keys you trust when it's loaded again,
+    /// rather than coming back from disk looking cleaner than it arrived.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signer: Option<String>,
 }
 
 /// Vault contents, as they exist decrypted in memory.
@@ -59,6 +65,13 @@ pub struct VaultData {
     /// Notification mode: "mentions", "all" or "off". Empty means the default.
     #[serde(default)]
     pub notify: String,
+    /// Base64 of this device's signing key seed. Empty in a vault written
+    /// before identities existed; one is generated on the next unlock.
+    #[serde(default)]
+    pub identity_b64: String,
+    /// Keys trusted for each name: base64 public keys, first-seen first.
+    #[serde(default)]
+    pub known_keys: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 impl VaultData {
@@ -190,8 +203,11 @@ mod tests {
                 user: "bmo".into(),
                 body: "hello".into(),
                 ts: 1,
+                signer: None,
             }],
             notify: "all".into(),
+            identity_b64: "cccc".into(),
+            known_keys: [("sam".to_string(), vec!["dddd".to_string()])].into(),
         }
     }
 
@@ -254,6 +270,7 @@ mod tests {
                 user: "u".into(),
                 body: format!("{i}"),
                 ts: i as i64,
+                signer: None,
             });
         }
         assert_eq!(data.history.len(), HISTORY_LIMIT);

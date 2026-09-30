@@ -9,10 +9,11 @@ use std::io::{IsTerminal, Read, Write};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use rustchat_core::identity::fingerprint;
 use rustchat_core::vault::open_vault;
-use rustchat_core::{Payload, proto};
+use rustchat_core::{Identity, Payload, Signer, proto};
 
-use crate::net::{self, NetCmd, NetEvent};
+use crate::net::{self, Incoming, NetCmd, NetEvent};
 use crate::{Cli, app};
 
 /// How long `send` waits for the relay to echo the message back.
@@ -34,6 +35,12 @@ fn target(cli: &Cli) -> Result<Target> {
         .clone()
         .unwrap_or_else(|| app::DEFAULT_RELAY.to_string());
     if let Some((conn, _, _)) = crate::resolve_direct(cli, &relay_hint)? {
+        if cli.identity.is_none() {
+            eprintln!(
+                "rustchat: signing with a throwaway key, so the room will flag this sender as \
+                 unrecognised. Set RUSTCHAT_IDENTITY (from `rustchat identity`) to keep one."
+            );
+        }
         return Ok(Target {
             conn,
             username: proto::sanitize_username(cli.username.as_deref().unwrap_or("anon")),
@@ -53,7 +60,7 @@ fn target(cli: &Cli) -> Result<Target> {
     let mut passphrase = passphrase()?;
     let data = open_vault(&passphrase, &bytes);
     zeroize::Zeroize::zeroize(&mut passphrase);
-    let data = data?;
+    let mut data = data?;
     if data.access_key_b64.is_empty() {
         bail!("this vault predates relay access keys; run `rustchat reset` and set up again");
     }
@@ -64,15 +71,30 @@ fn target(cli: &Cli) -> Result<Target> {
         None if !data.relay_url.is_empty() => data.relay_url.clone(),
         None => app::normalize_relay(app::DEFAULT_RELAY).map_err(|e| anyhow::anyhow!(e))?,
     };
-    let saved_name = (!data.username.is_empty()).then_some(data.username.as_str());
+    let saved_name = (!data.username.is_empty()).then_some(data.username.clone());
+    // A vault from before identities has none yet; the next TUI unlock makes
+    // and saves one. This run signs with a one-off key rather than writing
+    // the vault behind a TUI that may be open.
+    let identity = if data.identity_b64.is_empty() && cli.identity.is_none() {
+        eprintln!(
+            "rustchat: this vault has no identity yet — open it in rustchat once to make one."
+        );
+        Identity::generate()
+    } else {
+        crate::vault_identity(cli, &mut data)?
+    };
     Ok(Target {
         conn: net::Connection {
             relay_url,
             access,
             room: room.derive(),
+            identity,
         },
         username: proto::sanitize_username(
-            cli.username.as_deref().or(saved_name).unwrap_or("anon"),
+            cli.username
+                .as_deref()
+                .or(saved_name.as_deref())
+                .unwrap_or("anon"),
         ),
     })
 }
@@ -189,7 +211,7 @@ pub async fn send(cli: &Cli, words: &[String]) -> Result<()> {
                     sent = true;
                 }
                 // The relay echoes to the sender too; seeing it means it's in.
-                NetEvent::Payload(payload) if payload == ours => return Ok(()),
+                NetEvent::Payload(incoming) if incoming.payload == ours => return Ok(()),
                 NetEvent::Fatal(why) => bail!("{why}"),
                 NetEvent::Disconnected(why) if sent => {
                     bail!("the connection dropped before the relay confirmed it ({why})")
@@ -238,22 +260,38 @@ pub async fn tail(cli: &Cli, json: bool, backlog: bool) -> Result<()> {
 
 fn print_payload(
     out: &mut impl Write,
-    payload: &Payload,
+    incoming: &Incoming,
     json: bool,
     replay: bool,
 ) -> std::io::Result<()> {
+    let payload = &incoming.payload;
     if json {
         let mut value = serde_json::to_value(payload).map_err(std::io::Error::other)?;
         value["replay"] = replay.into();
+        // The fingerprint rather than a verdict: `tail` keeps no list of
+        // trusted keys, so a bot decides for itself which ones it believes.
+        match incoming.signer {
+            Signer::Valid(pk) => {
+                value["signature"] = "valid".into();
+                value["key"] = fingerprint(&pk).into();
+            }
+            Signer::Unsigned => value["signature"] = "unsigned".into(),
+            Signer::Invalid => value["signature"] = "invalid".into(),
+        }
         writeln!(out, "{value}")?;
         return out.flush();
     }
+    let mark = match incoming.signer {
+        Signer::Valid(_) => "",
+        Signer::Unsigned => " [unsigned]",
+        Signer::Invalid => " [bad signature]",
+    };
     match payload {
         Payload::Msg { user, body, ts } => {
             // Continuation lines indented, so a multi-line message still
             // reads as one message to `grep` and to eyes.
             let body = body.replace('\n', "\n      ");
-            writeln!(out, "{} {user}: {body}", clock(*ts))?;
+            writeln!(out, "{} {user}{mark}: {body}", clock(*ts))?;
         }
         // Presence from a replay says nothing about now, as in the TUI.
         Payload::Join { user, ts } if !replay => {
@@ -306,10 +344,10 @@ mod tests {
             body: "build failed\nsee log".into(),
             ts: 0,
         };
-        print_payload(&mut out, &p, false, false).unwrap();
+        print_payload(&mut out, &p.into(), false, false).unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(
-            text.ends_with("ci: build failed\n      see log\n"),
+            text.ends_with("ci [unsigned]: build failed\n      see log\n"),
             "{text:?}"
         );
     }
@@ -322,13 +360,20 @@ mod tests {
             body: "a\nb".into(),
             ts: 5,
         };
-        print_payload(&mut out, &p, true, true).unwrap();
+        let id = Identity::generate();
+        let incoming = Incoming {
+            payload: p,
+            signer: Signer::Valid(id.public()),
+        };
+        print_payload(&mut out, &incoming, true, true).unwrap();
         let text = String::from_utf8(out).unwrap();
         assert_eq!(text.lines().count(), 1);
         let value: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(value["kind"], "msg");
         assert_eq!(value["body"], "a\nb");
         assert_eq!(value["replay"], true);
+        assert_eq!(value["signature"], "valid");
+        assert_eq!(value["key"], fingerprint(&id.public()));
     }
 
     #[test]
@@ -338,7 +383,7 @@ mod tests {
             user: "sam".into(),
             ts: 0,
         };
-        print_payload(&mut out, &p, false, true).unwrap();
+        print_payload(&mut out, &p.into(), false, true).unwrap();
         assert!(out.is_empty());
     }
 }
