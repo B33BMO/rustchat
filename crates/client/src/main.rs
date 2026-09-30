@@ -7,6 +7,7 @@
 //! See `rustchat-core` for the details.
 
 mod app;
+mod headless;
 mod net;
 mod ui;
 mod update;
@@ -35,7 +36,7 @@ use rustchat_core::{AccessKey, Invite, Payload, RoomKey, proto};
 )]
 struct Cli {
     /// Relay to connect to. Overrides the one saved in your vault.
-    #[arg(long, short)]
+    #[arg(long, short, global = true)]
     relay: Option<String>,
 
     /// Use this room key for this session only, skipping the vault entirely.
@@ -43,28 +44,33 @@ struct Cli {
     ///
     /// Prefer the `RUSTCHAT_ROOM_KEY` environment variable: an argument is
     /// visible to anyone who can list processes on this machine.
-    #[arg(long, env = "RUSTCHAT_ROOM_KEY", hide_env_values = true)]
+    #[arg(long, env = "RUSTCHAT_ROOM_KEY", hide_env_values = true, global = true)]
     room_key: Option<String>,
 
     /// The relay's access key, which decides who may connect at all.
-    #[arg(long, env = "RUSTCHAT_ACCESS_KEY", hide_env_values = true)]
+    #[arg(
+        long,
+        env = "RUSTCHAT_ACCESS_KEY",
+        hide_env_values = true,
+        global = true
+    )]
     access_key: Option<String>,
 
     /// Join straight from an invite, skipping the vault. Carries the relay,
     /// its access key and a room key in one value.
-    #[arg(long, env = "RUSTCHAT_INVITE", hide_env_values = true)]
+    #[arg(long, env = "RUSTCHAT_INVITE", hide_env_values = true, global = true)]
     invite: Option<String>,
 
     /// Username for this session. Overrides the saved one.
-    #[arg(long, short)]
+    #[arg(long, short, global = true)]
     username: Option<String>,
 
     /// Touch no disk: no vault is read or written, and nothing is remembered.
-    #[arg(long)]
+    #[arg(long, global = true)]
     no_vault: bool,
 
     /// Path to the vault file.
-    #[arg(long)]
+    #[arg(long, global = true)]
     vault: Option<PathBuf>,
 
     /// Don't check GitHub for a newer release on launch.
@@ -103,6 +109,24 @@ enum Command {
         #[arg(long, short = 'k')]
         room_key: Option<String>,
     },
+    /// Post one message and exit once the relay has it — for scripts and cron.
+    ///
+    /// Uses --invite / RUSTCHAT_INVITE if given, otherwise your vault (with
+    /// the passphrase from RUSTCHAT_PASSPHRASE, or asked for). Exits non-zero
+    /// if the relay didn't confirm it.
+    Send {
+        /// The message. Omit it (or pass `-`) to read it from stdin.
+        message: Vec<String>,
+    },
+    /// Print the room's backlog, then follow it live.
+    Tail {
+        /// One JSON object per line, for scripts and bots.
+        #[arg(long)]
+        json: bool,
+        /// Skip the backlog; only print what arrives from now on.
+        #[arg(long)]
+        no_history: bool,
+    },
     /// Print where the vault lives.
     Where,
     /// Delete the vault. The room itself is unaffected.
@@ -126,17 +150,24 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some(Command::Reset) => reset(&vault_path(&cli)?),
+        Some(Command::Send { ref message }) => runtime()?.block_on(headless::send(&cli, message)),
+        Some(Command::Tail { json, no_history }) => {
+            runtime()?.block_on(headless::tail(&cli, json, !no_history))
+        }
         None => {
             // Before the TUI takes the terminal, so the prompt is plain text.
             update::offer(cli.no_update_check);
-            // The runtime is only built for the chat path; the subcommands
-            // above are synchronous and shouldn't pay for it.
-            tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()?
-                .block_on(chat(cli))
+            runtime()?.block_on(chat(cli))
         }
     }
+}
+
+/// Built only for the paths that talk to a relay; the key-handling
+/// subcommands are synchronous and shouldn't pay for it.
+fn runtime() -> Result<tokio::runtime::Runtime> {
+    Ok(tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?)
 }
 
 /// Selects the TLS backend rustls will use, before anything can use TLS.

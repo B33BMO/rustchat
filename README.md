@@ -195,6 +195,23 @@ rustchat authkey <access key>            # the auth key a relay needs
 rustchat invite --relay … --access-key … --room-key …
 ```
 
+### Scripts and bots
+
+`send` and `tail` use a room without the TUI:
+
+```sh
+rustchat send "deploy finished"                  # one message; exits once the relay has it
+make 2>&1 | tail -5 | rustchat send -u ci        # or pipe it in
+rustchat tail                                    # backlog, then follow live
+rustchat tail --json | jq -r 'select(.kind=="msg") | .body'
+```
+
+`send` exits non-zero if the relay didn't confirm the message. Neither command
+announces a join, so a bot doesn't fill the room with presence lines. For
+unattended use, give them an invite through `RUSTCHAT_INVITE`; otherwise they
+open your vault, with the passphrase from `RUSTCHAT_PASSPHRASE` or asked for on
+the terminal.
+
 `RUSTCHAT_INVITE`, `RUSTCHAT_ROOM_KEY` and `RUSTCHAT_ACCESS_KEY` do the same as
 the matching flags without putting secrets in your shell history or in `ps`
 output.
