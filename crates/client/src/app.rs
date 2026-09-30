@@ -1,5 +1,6 @@
 //! Client state and key handling. Knows nothing about drawing or sockets.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -262,6 +263,69 @@ impl App {
                 });
             }
             _ => return,
+        }
+        self.trim();
+    }
+
+    /// Takes the backlog the relay replays on every connect.
+    ///
+    /// That backlog overlaps whatever is already here — lines from the vault,
+    /// and after a reconnect, lines already on screen — so only chat not seen
+    /// before is shown. Those lines are also kept in the vault, which is what
+    /// lets a device that first caught up from the relay keep that history
+    /// once the relay has moved on.
+    pub fn absorb_backlog(&mut self, payloads: Vec<Payload>) {
+        let mut seen: HashSet<(String, i64, String)> = self
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::Msg { user, body, ts, .. } => Some((user.clone(), *ts, body.clone())),
+                _ => None,
+            })
+            .chain(
+                self.vault
+                    .history
+                    .iter()
+                    .map(|line| (line.user.clone(), line.ts, line.body.clone())),
+            )
+            .collect();
+        // Presence is dropped from a replay anyway (see `absorb`), and a line
+        // identical in sender, millisecond and text is the same line.
+        let fresh: Vec<(String, String, i64)> = payloads
+            .into_iter()
+            .filter_map(|payload| match payload {
+                Payload::Msg { user, body, ts } => Some((user, body, ts)),
+                _ => None,
+            })
+            .filter(|(user, body, ts)| seen.insert((user.clone(), *ts, body.clone())))
+            .collect();
+        if fresh.is_empty() {
+            return;
+        }
+        // Before the lines, not after: it is a heading for what follows.
+        self.system(
+            format!(
+                "— {} earlier line{} from the relay —",
+                fresh.len(),
+                plural(fresh.len())
+            ),
+            Level::Info,
+        );
+        for (user, body, ts) in fresh {
+            if !self.ephemeral {
+                self.vault.push_line(StoredLine {
+                    user: user.clone(),
+                    body: body.clone(),
+                    ts,
+                });
+            }
+            let own = user == self.username;
+            self.entries.push(Entry::Msg {
+                user,
+                body,
+                ts,
+                own,
+            });
         }
         self.trim();
     }
@@ -1052,6 +1116,65 @@ mod tests {
             false,
         );
         assert_eq!(app.entries.len(), 1, "other people's presence still shows");
+    }
+
+    fn said(user: &str, body: &str, ts: i64) -> Payload {
+        Payload::Msg {
+            user: user.into(),
+            body: body.into(),
+            ts,
+        }
+    }
+
+    #[test]
+    fn a_reconnect_does_not_replay_what_is_already_on_screen() {
+        let mut app = app();
+        app.absorb_backlog(vec![said("sam", "a", 1), said("sam", "b", 2)]);
+        let before = app.entries.len();
+        // The relay replays its whole buffer on every connect.
+        app.absorb_backlog(vec![said("sam", "a", 1), said("sam", "b", 2)]);
+        assert_eq!(app.entries.len(), before, "nothing new, so nothing shown");
+        app.absorb_backlog(vec![
+            said("sam", "a", 1),
+            said("sam", "b", 2),
+            said("sam", "c", 3),
+        ]);
+        let bodies: Vec<&str> = app
+            .entries
+            .iter()
+            .filter_map(|e| match e {
+                Entry::Msg { body, .. } => Some(body.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(bodies, ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn the_backlog_skips_lines_the_vault_already_has() {
+        let mut app = app();
+        app.vault.push_line(StoredLine {
+            user: "sam".into(),
+            body: "old".into(),
+            ts: 1,
+        });
+        app.load_history();
+        app.absorb_backlog(vec![said("sam", "old", 1), said("sam", "new", 2)]);
+        assert!(matches!(
+            app.entries.iter().rev().nth(1),
+            Some(Entry::System { body, .. }) if body.contains("1 earlier line")
+        ));
+    }
+
+    #[test]
+    fn a_new_device_keeps_what_it_caught_up_on() {
+        let mut app = app();
+        app.ephemeral = false;
+        app.absorb_backlog(vec![said("sam", "from before", 1)]);
+        assert_eq!(app.vault.history.len(), 1);
+        // And a second replay doesn't save it twice.
+        app.absorb_backlog(vec![said("sam", "from before", 1)]);
+        assert_eq!(app.vault.history.len(), 1);
     }
 
     #[test]

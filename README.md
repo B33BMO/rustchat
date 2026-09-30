@@ -252,9 +252,18 @@ the relay one tells it nothing about the other. Usernames, message bodies and
 timestamps all live *inside* the sealed payload, so the relay's whole view of a
 room is an opaque id, a socket count and a pile of bytes.
 
-Rooms are created by being joined and reclaimed when abandoned: an empty room
-keeps its replay buffer for ten minutes in case someone reconnects, then is
-forgotten. Each room's buffer is bounded by both message count and total bytes.
+Rooms are created by being joined. Each keeps a replay buffer of recent
+traffic — the last 200 envelopes, capped at 256 KiB — that is sent to anyone
+who joins, which is how a second device catches up on what it missed. Your
+client drops lines it has already shown and keeps the rest in your vault.
+
+With `--data-dir` (the systemd setup uses `/var/lib/rustchat-relay`) those
+buffers are saved to disk, so they survive a relay restart and a room sitting
+empty; a room's file is deleted 30 days after its last message
+(`--retention-days`), and at most 256 rooms are kept (`--max-stored-rooms`).
+Without it, history is memory-only: a restart forgets it, and an empty room is
+forgotten after ten minutes. Either way the relay holds only room ids and
+ciphertext.
 
 Your vault is XChaCha20-Poly1305 under an Argon2id stretch of your passphrase,
 written `0600` via a temp-file rename so an interrupted save can't corrupt it.
@@ -264,8 +273,9 @@ written `0600` via a temp-file rename so an interrupted save can't corrupt it.
 Worth being straight about:
 
 - **A leaked room key.** It's the only thing protecting a room. Anyone with it
-  reads everything, including the relay's replay buffer. Rotating means a new
-  key and telling everyone — but not touching the relay.
+  reads everything, including the relay's replay buffer — and with a data
+  directory, a copy of that buffer on the relay's disk for up to 30 days.
+  Rotating means a new key and telling everyone — but not touching the relay.
 - **A leaked invite.** It contains both keys. Treat it like the room key.
 - **Impersonation inside the room.** Names aren't authenticated. If you're in
   the room, you can send as anyone. The key gets you in the door; it doesn't

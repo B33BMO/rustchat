@@ -95,6 +95,11 @@ cat > "$ENV_FILE" <<EOF
 RUSTCHAT_AUTH_KEY=$AUTH_KEY
 RUSTCHAT_BIND=127.0.0.1:$PORT
 RUSTCHAT_HISTORY=$HISTORY
+# Room backlogs are kept here so they survive restarts and let another device
+# catch up later. Ciphertext only. Comment out to keep history in memory.
+RUSTCHAT_DATA_DIR=/var/lib/rustchat-relay
+RUSTCHAT_RETENTION_DAYS=30
+RUSTCHAT_MAX_STORED_ROOMS=256
 RUSTCHAT_MAX_CONNS=200
 RUSTCHAT_MAX_ROOMS=64
 # Seconds of silence before a connection is assumed dead. Clients ping every
