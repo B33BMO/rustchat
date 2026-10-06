@@ -1865,7 +1865,7 @@ dependencies = [
 
 [[package]]
 name = "rustchat"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -1887,7 +1887,7 @@ dependencies = [
 
 [[package]]
 name = "rustchat-core"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1905,7 +1905,7 @@ dependencies = [
 
 [[package]]
 name = "rustchat-relay"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "anyhow",
  "axum",
