@@ -222,12 +222,21 @@ the terminal.
 the matching flags without putting secrets in your shell history or in `ps`
 output.
 
-When the window isn't focused, a message that says `@yourname` rings the
-bell and raises a desktop notification, in terminals that support one (iTerm2,
-WezTerm, Ghostty, kitty, Windows Terminal; under tmux, also
-`set -g allow-passthrough on`). The notification says who, never what: message
-text stays out of your OS's notification centre. Mentions also get a marker in
-the transcript.
+When the window isn't focused, a message that says `@yourname` rings the bell
+and raises a desktop notification. The notification says who, never what:
+message text stays out of your OS's notification centre and off your lock
+screen. Mentions also get a marker in the transcript.
+
+How the notification gets raised depends on where you are:
+
+- **iTerm2, WezTerm, Ghostty, kitty, foot** — an OSC 9 escape, which the
+  terminal turns into a notification. Under tmux this also needs
+  `set -g allow-passthrough on`.
+- **WSL** — Windows Terminal implements ConEmu's numbered OSC 9 subcommands
+  rather than the free-text form, so the escape does nothing there. rustchat
+  raises a real Windows toast instead, through `powershell.exe`. Nothing to
+  install and nothing to configure.
+- **Anywhere else** — the bell, which every terminal has.
 
 ### "the relay turned us away"
 

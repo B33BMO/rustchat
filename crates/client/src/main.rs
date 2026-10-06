@@ -9,6 +9,7 @@
 mod app;
 mod headless;
 mod net;
+mod notify;
 mod ui;
 mod update;
 
@@ -510,7 +511,7 @@ async fn run(
         };
 
         if let Some(text) = app.alert.take() {
-            ring(&text);
+            notify::alert(&text);
         }
 
         match action {
@@ -544,28 +545,6 @@ async fn run(
         }
     }
     Ok(())
-}
-
-/// Rings the terminal bell and asks the terminal for a desktop notification.
-///
-/// OSC 9 is understood by iTerm2, WezTerm, Ghostty, kitty and Windows
-/// Terminal, and silently ignored elsewhere, where the bell still works.
-/// Under tmux it has to be wrapped to pass through, which also needs
-/// `set -g allow-passthrough on`.
-fn ring(text: &str) {
-    use std::io::Write;
-    // Control characters would end the escape sequence early. Names are
-    // sanitised already; this is belt and braces.
-    let text: String = text.chars().filter(|c| !c.is_control()).collect();
-    let osc = format!("\x1b]9;rustchat: {text}\x07");
-    let osc = if std::env::var_os("TMUX").is_some() {
-        format!("\x1bPtmux;{}\x1b\\", osc.replace('\x1b', "\x1b\x1b"))
-    } else {
-        osc
-    };
-    let mut out = std::io::stdout();
-    let _ = write!(out, "\x07{osc}");
-    let _ = out.flush();
 }
 
 /// Awaits the next network event, or parks forever if there is no connection.
