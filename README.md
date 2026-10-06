@@ -181,6 +181,7 @@ Type to talk. Enter sends.
 | `/untrust <name> <fingerprint>` | stop trusting one |
 | `/who` | how many connections are in the room |
 | `/notify mentions\|all\|off` | when to ring and notify (default: `@you` only) |
+| `/notify test` | fire one now and report whether it worked |
 | `/clear` | wipe the view |
 | `/forget` | erase saved history from your vault |
 | `/quit` | leave |
@@ -237,6 +238,11 @@ How the notification gets raised depends on where you are:
   raises a real Windows toast instead, through `powershell.exe`. Nothing to
   install and nothing to configure.
 - **Anywhere else** — the bell, which every terminal has.
+
+Notifications only arrive while the window *isn't* focused, so `/notify test`
+exists to check them without having to look away at the right moment. It
+ignores both the mode and the focus rule, and says what went wrong if the
+notification failed.
 
 ### "the relay turned us away"
 
