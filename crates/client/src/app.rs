@@ -950,7 +950,7 @@ impl App {
             "help" | "h" | "?" => {
                 self.system(
                     "/invite one-paste invite · /key show the room key · /nick <name> rename \
-                     · /who occupancy · /notify mentions|all|off · Ctrl-F search \
+                     · /who occupancy · /notify mentions|all|off|test · Ctrl-F search \
                      · /whoami your key · /keys known keys · /trust <name> <fingerprint> \
                      · /clear wipe the view · /forget erase saved history · /quit",
                     Level::Info,
@@ -1061,10 +1061,26 @@ impl App {
                 if arg.is_empty() {
                     self.system(
                         format!(
-                            "Notifications: {}. /notify mentions|all|off to change.",
+                            "Notifications: {}. /notify mentions|all|off to change, \
+                             /notify test to check they work.",
                             self.notify.as_str()
                         ),
                         Level::Info,
+                    );
+                    return Action::None;
+                }
+                if arg.eq_ignore_ascii_case("test") {
+                    // Deliberately ignores both the mode and the focus rule.
+                    // Checking whether notifications work at all otherwise
+                    // means arranging to be looking somewhere else at the
+                    // moment a message lands, which is awkward enough that
+                    // it reads as "notifications are broken".
+                    self.alert = Some("test notification".into());
+                    self.system(
+                        "Sent a test notification. It ignores the focus rule, so you should \
+                         see it even while looking at this window. Real ones only arrive \
+                         while this window isn't focused.",
+                        Level::Good,
                     );
                     return Action::None;
                 }
@@ -1085,7 +1101,7 @@ impl App {
                             Level::Good,
                         );
                     }
-                    None => self.system("Usage: /notify mentions|all|off", Level::Bad),
+                    None => self.system("Usage: /notify mentions|all|off|test", Level::Bad),
                 }
                 Action::None
             }
@@ -1917,6 +1933,33 @@ mod tests {
         app.notify = Notify::Off;
         app.absorb(said("sam", "@bmo", 6), false);
         assert!(app.alert.is_none());
+    }
+
+    #[test]
+    fn notify_test_fires_regardless_of_focus_or_mode() {
+        // The whole point: it must work while you are looking at the window,
+        // and whatever the mode is, or it cannot tell you anything.
+        let mut app = app();
+        app.focused = Some(true);
+        app.notify = Notify::Off;
+        app.input = "/notify test".into();
+        app.cursor = app.input.chars().count();
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            app.alert.take().is_some(),
+            "a test notification should fire even focused and even with notify off"
+        );
+    }
+
+    #[test]
+    fn notify_test_does_not_change_the_mode() {
+        let mut app = app();
+        app.notify = Notify::Mentions;
+        app.input = "/notify test".into();
+        app.cursor = app.input.chars().count();
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.notify, Notify::Mentions, "test is not a mode");
+        assert_eq!(app.vault.notify, "", "test must not be saved as a mode");
     }
 
     #[test]
