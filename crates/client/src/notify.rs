@@ -20,9 +20,11 @@ use std::time::{Duration, Instant};
 
 /// Shortest gap between desktop notifications.
 ///
-/// With `/notify all` in a busy room every message would otherwise spawn a
-/// process. Dropping the extras is fine: the notification says only that
-/// something arrived, and the transcript has the rest.
+/// `powershell.exe` takes half a second to start, so with `/notify all` in a
+/// busy room one process per message would be a storm. Anything arriving
+/// inside the gap is held and folded into a single follow-up notification
+/// rather than dropped — on `all` the whole point is to hear about every
+/// message, so silently discarding some would defeat it.
 const MIN_GAP: Duration = Duration::from_secs(4);
 
 /// Longest notification text passed on. Long enough for "someone mentioned
@@ -43,9 +45,107 @@ const POWERSHELL_APP_ID: &str =
 /// an OS notification where the terminal can't.
 pub fn alert(text: &str) {
     let text = sanitize(text);
+    // The bell is instant and costs nothing, so it always rings, once per
+    // message, however fast they arrive.
     ring_terminal(&text);
-    if desktop_notifications_available() && throttle_allows(Instant::now()) {
-        raise_desktop_notification(&text);
+    if !desktop_notifications_available() {
+        return;
+    }
+    match throttle().offer(text, Instant::now()) {
+        Decision::Send(text) => raise_desktop_notification(&text),
+        Decision::Defer(delay) => schedule_flush(delay),
+        Decision::Held => {}
+    }
+}
+
+/// Sleeps out the gap, then sends whatever piled up behind it.
+fn schedule_flush(delay: Duration) {
+    std::thread::spawn(move || {
+        std::thread::sleep(delay);
+        if let Some(text) = throttle().flush(Instant::now()) {
+            raise_desktop_notification(&text);
+        }
+    });
+}
+
+/// The process-wide notification throttle.
+fn throttle() -> std::sync::MutexGuard<'static, Throttle> {
+    static THROTTLE: Mutex<Throttle> = Mutex::new(Throttle::new());
+    // A poisoned lock means an earlier caller panicked mid-update, which is
+    // no reason to stop notifying.
+    THROTTLE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// What should happen to a notification that has just come in.
+#[derive(Debug, PartialEq, Eq)]
+enum Decision {
+    /// Raise it now.
+    Send(String),
+    /// Hold it, and flush after this long. Only the caller that schedules the
+    /// flush gets this; later ones get [`Decision::Held`].
+    Defer(Duration),
+    /// Hold it; a flush is already on its way.
+    Held,
+}
+
+/// Rate-limits notifications without losing any.
+#[derive(Debug)]
+struct Throttle {
+    last_sent: Option<Instant>,
+    /// How many have piled up since the last one went out.
+    waiting: usize,
+    /// The most recent held text, used when exactly one is waiting.
+    waiting_text: Option<String>,
+    flush_scheduled: bool,
+}
+
+impl Throttle {
+    const fn new() -> Self {
+        Self {
+            last_sent: None,
+            waiting: 0,
+            waiting_text: None,
+            flush_scheduled: false,
+        }
+    }
+
+    fn offer(&mut self, text: String, now: Instant) -> Decision {
+        let too_soon = self
+            .last_sent
+            .is_some_and(|last| now.duration_since(last) < MIN_GAP);
+        if !too_soon {
+            self.last_sent = Some(now);
+            return Decision::Send(text);
+        }
+
+        self.waiting += 1;
+        self.waiting_text = Some(text);
+        if self.flush_scheduled {
+            return Decision::Held;
+        }
+        self.flush_scheduled = true;
+        let since = self
+            .last_sent
+            .map_or(MIN_GAP, |last| now.duration_since(last));
+        Decision::Defer(MIN_GAP.saturating_sub(since))
+    }
+
+    /// Takes whatever is waiting, as a single line.
+    fn flush(&mut self, now: Instant) -> Option<String> {
+        self.flush_scheduled = false;
+        let waiting = std::mem::replace(&mut self.waiting, 0);
+        let text = self.waiting_text.take()?;
+        if waiting == 0 {
+            return None;
+        }
+        self.last_sent = Some(now);
+        Some(if waiting == 1 {
+            text
+        } else {
+            format!("{waiting} new messages")
+        })
     }
 }
 
@@ -79,21 +179,6 @@ fn terminal_sequence(text: &str, in_tmux: bool) -> String {
         osc
     };
     format!("\x07{osc}")
-}
-
-/// At most one desktop notification per [`MIN_GAP`].
-fn throttle_allows(now: Instant) -> bool {
-    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
-    // A poisoned lock here means a previous caller panicked mid-check, which
-    // is no reason to stop notifying.
-    let mut last = LAST.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    match *last {
-        Some(previous) if now.duration_since(previous) < MIN_GAP => false,
-        _ => {
-            *last = Some(now);
-            true
-        }
-    }
 }
 
 /// Whether this machine has a way to raise an OS notification.
@@ -229,12 +314,112 @@ mod tests {
     }
 
     #[test]
-    fn throttle_lets_the_first_through_then_waits() {
+    fn the_first_notification_goes_straight_out() {
+        let mut throttle = Throttle::new();
+        assert_eq!(
+            throttle.offer("sam mentioned you".into(), Instant::now()),
+            Decision::Send("sam mentioned you".into())
+        );
+    }
+
+    #[test]
+    fn a_burst_is_folded_into_one_follow_up() {
+        // The behaviour that matters on `/notify all`: nothing is dropped,
+        // but a busy room does not spawn a process per message.
         let start = Instant::now();
-        assert!(throttle_allows(start), "the first notification should go");
-        assert!(!throttle_allows(start + Duration::from_millis(500)));
-        assert!(!throttle_allows(start + MIN_GAP - Duration::from_millis(1)));
-        assert!(throttle_allows(start + MIN_GAP + Duration::from_millis(1)));
+        let mut throttle = Throttle::new();
+        throttle.offer("first".into(), start);
+
+        // Three more arrive inside the gap. Only the first schedules a flush.
+        assert!(matches!(
+            throttle.offer("second".into(), start + Duration::from_millis(100)),
+            Decision::Defer(_)
+        ));
+        assert_eq!(
+            throttle.offer("third".into(), start + Duration::from_millis(200)),
+            Decision::Held
+        );
+        assert_eq!(
+            throttle.offer("fourth".into(), start + Duration::from_millis(300)),
+            Decision::Held
+        );
+
+        let flushed = throttle.flush(start + MIN_GAP).expect("something was held");
+        assert_eq!(
+            flushed, "3 new messages",
+            "all three should be accounted for"
+        );
+    }
+
+    #[test]
+    fn a_single_held_message_keeps_its_own_words() {
+        // "1 new messages" would be both wrong and less useful than the text.
+        let start = Instant::now();
+        let mut throttle = Throttle::new();
+        throttle.offer("first".into(), start);
+        throttle.offer(
+            "sam mentioned you".into(),
+            start + Duration::from_millis(50),
+        );
+        assert_eq!(
+            throttle.flush(start + MIN_GAP),
+            Some("sam mentioned you".to_string())
+        );
+    }
+
+    #[test]
+    fn the_deferred_delay_covers_the_rest_of_the_gap() {
+        let start = Instant::now();
+        let mut throttle = Throttle::new();
+        throttle.offer("first".into(), start);
+        let Decision::Defer(delay) =
+            throttle.offer("second".into(), start + Duration::from_secs(1))
+        else {
+            panic!("should have deferred");
+        };
+        assert_eq!(delay, MIN_GAP - Duration::from_secs(1));
+    }
+
+    #[test]
+    fn flushing_with_nothing_held_sends_nothing() {
+        let mut throttle = Throttle::new();
+        assert_eq!(throttle.flush(Instant::now()), None);
+    }
+
+    #[test]
+    fn the_gap_restarts_after_a_flush() {
+        let start = Instant::now();
+        let mut throttle = Throttle::new();
+        throttle.offer("first".into(), start);
+        throttle.offer("second".into(), start + Duration::from_millis(10));
+        throttle.flush(start + MIN_GAP);
+
+        // Straight after a flush the next one must wait again, not stampede.
+        assert!(matches!(
+            throttle.offer("third".into(), start + MIN_GAP + Duration::from_millis(10)),
+            Decision::Defer(_)
+        ));
+        // And once the gap has passed, it goes out immediately.
+        assert!(matches!(
+            throttle.offer(
+                "fourth".into(),
+                start + MIN_GAP + MIN_GAP + Duration::from_secs(1)
+            ),
+            Decision::Send(_)
+        ));
+    }
+
+    #[test]
+    fn a_quiet_room_never_defers() {
+        let mut now = Instant::now();
+        let mut throttle = Throttle::new();
+        for _ in 0..5 {
+            assert!(
+                matches!(throttle.offer("ping".into(), now), Decision::Send(_)),
+                "messages spaced out should each notify"
+            );
+            now += MIN_GAP + Duration::from_secs(1);
+        }
     }
 
     #[test]
