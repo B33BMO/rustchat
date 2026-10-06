@@ -266,6 +266,9 @@ pub struct App {
     /// A notification waiting to be written to the terminal. Taken by the
     /// event loop, which owns stdout; the app only decides one is due.
     pub alert: Option<String>,
+    /// Set by `/notify test`. The event loop runs the check and reports,
+    /// since raising a notification is its side of the house, not this one's.
+    pub notify_selftest: bool,
     /// Set while searching; the input box edits the query instead.
     pub search: Option<Search>,
     /// This device's public key, once there is one.
@@ -299,6 +302,7 @@ impl App {
             notify: Notify::Mentions,
             focused: None,
             alert: None,
+            notify_selftest: false,
             search: None,
             identity: None,
             seen_keys: Default::default(),
@@ -1073,15 +1077,9 @@ impl App {
                     // Deliberately ignores both the mode and the focus rule.
                     // Checking whether notifications work at all otherwise
                     // means arranging to be looking somewhere else at the
-                    // moment a message lands, which is awkward enough that
-                    // it reads as "notifications are broken".
-                    self.alert = Some("test notification".into());
-                    self.system(
-                        "Sent a test notification. It ignores the focus rule, so you should \
-                         see it even while looking at this window. Real ones only arrive \
-                         while this window isn't focused.",
-                        Level::Good,
-                    );
+                    // moment a message lands, which is awkward enough that it
+                    // reads as "notifications are broken".
+                    self.notify_selftest = true;
                     return Action::None;
                 }
                 match Notify::parse(&arg) {
@@ -1946,8 +1944,8 @@ mod tests {
         app.cursor = app.input.chars().count();
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(
-            app.alert.take().is_some(),
-            "a test notification should fire even focused and even with notify off"
+            app.notify_selftest,
+            "a test should be requested even focused and even with notify off"
         );
     }
 

@@ -514,6 +514,19 @@ async fn run(
             notify::alert(&text);
         }
 
+        if std::mem::take(&mut app.notify_selftest) {
+            // Synchronous on purpose: the point is to report what happened,
+            // and half a second is a fair price for an explicit diagnostic.
+            match notify::self_test() {
+                Ok(()) => app.system(
+                    "Test notification sent. You should see it even with this window \
+                     focused; real ones only arrive while it isn't.",
+                    Level::Good,
+                ),
+                Err(why) => app.system(format!("Test notification failed: {why}"), Level::Bad),
+            }
+        }
+
         match action {
             Action::None => {}
             Action::Quit => {

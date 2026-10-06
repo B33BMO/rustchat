@@ -211,6 +211,15 @@ fn toast_app_id() -> &'static str {
     }
 }
 
+/// The variables the toast script reads. WSL forwards an environment
+/// variable to a Windows process only if it is named in `WSLENV`, so these
+/// have to be declared there or PowerShell sees nothing at all.
+const TOAST_VARS: [&str; 3] = [
+    "RUSTCHAT_TOAST_TITLE",
+    "RUSTCHAT_TOAST_BODY",
+    "RUSTCHAT_TOAST_APPID",
+];
+
 /// The PowerShell that builds and shows the toast.
 ///
 /// It takes its text from the environment rather than from arguments, so no
@@ -241,12 +250,28 @@ fn encode_powershell_command(script: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(utf16)
 }
 
-/// Fires the toast without waiting for it.
+/// Adds the toast variables to a `WSLENV` value, keeping what is already there.
 ///
-/// `powershell.exe` takes around half a second to start, which is far too
-/// long to hold up a redraw, so it runs on its own thread. The thread waits
-/// on the child purely so it is reaped rather than left as a zombie.
-fn raise_desktop_notification(text: &str) {
+/// Entries may carry flags such as `NAME/p`, so a name is compared up to the
+/// slash rather than whole.
+fn wslenv_with_toast_vars(existing: Option<&str>) -> String {
+    let mut parts: Vec<String> = existing
+        .unwrap_or("")
+        .split(':')
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect();
+    for var in TOAST_VARS {
+        let already = parts.iter().any(|part| part.split('/').next() == Some(var));
+        if !already {
+            parts.push(var.to_string());
+        }
+    }
+    parts.join(":")
+}
+
+/// Builds the command that shows one toast.
+fn toast_command(text: &str) -> std::process::Command {
     static ENCODED: OnceLock<String> = OnceLock::new();
     let encoded = ENCODED.get_or_init(|| encode_powershell_command(TOAST_SCRIPT));
 
@@ -256,17 +281,74 @@ fn raise_desktop_notification(text: &str) {
         .env("RUSTCHAT_TOAST_TITLE", "rustchat")
         .env("RUSTCHAT_TOAST_BODY", text)
         .env("RUSTCHAT_TOAST_APPID", toast_app_id())
-        .stdin(std::process::Stdio::null())
+        .env(
+            "WSLENV",
+            wslenv_with_toast_vars(std::env::var("WSLENV").ok().as_deref()),
+        )
+        .stdin(std::process::Stdio::null());
+    command
+}
+
+/// Fires the toast without waiting for it.
+///
+/// `powershell.exe` takes around half a second to start, which is far too
+/// long to hold up a redraw, so it runs on its own thread. The thread waits
+/// on the child purely so it is reaped rather than left as a zombie.
+fn raise_desktop_notification(text: &str) {
+    let mut command = toast_command(text);
+    command
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-
     std::thread::spawn(move || {
-        // Nothing to do about a failure: the bell has already rung, and a
-        // missing powershell.exe is not worth interrupting a chat over.
+        // Nothing to be done about a failure here, and the bell has already
+        // rung. `/notify test` is the path that reports what went wrong.
         if let Ok(mut child) = command.spawn() {
             let _ = child.wait();
         }
     });
+}
+
+/// Raises one notification and waits to see whether it worked.
+///
+/// Used by `/notify test`. The ordinary path throws failures away, which once
+/// hid a completely broken toast behind a working bell for a whole release —
+/// so the diagnostic reports what the ordinary path cannot.
+pub fn self_test() -> Result<(), String> {
+    let text = sanitize("test notification");
+    ring_terminal(&text);
+    if !desktop_notifications_available() {
+        return Err(
+            "no desktop notifier here — rang the bell only. Desktop notifications are \
+             raised under WSL; elsewhere it depends on your terminal honouring OSC 9."
+                .into(),
+        );
+    }
+    let output = toast_command(&text)
+        .output()
+        .map_err(|err| format!("could not run powershell.exe: {err}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(first_powershell_error(&stderr))
+}
+
+/// Pulls something readable out of PowerShell's CLIXML error spew.
+fn first_powershell_error(stderr: &str) -> String {
+    let message = stderr
+        .split("<S S=\"Error\">")
+        .nth(1)
+        .and_then(|rest| rest.split("</S>").next())
+        .unwrap_or(stderr)
+        .replace("_x000D_", "")
+        .replace("_x000A_", "")
+        .trim()
+        .to_string();
+    if message.is_empty() {
+        "powershell.exe reported an error with no message".into()
+    } else {
+        message
+    }
 }
 
 #[cfg(test)]
@@ -443,6 +525,65 @@ mod tests {
         // "echo hi" as UTF-16LE: every ASCII byte followed by a zero.
         assert_eq!(decoded.len(), "echo hi".len() * 2);
         assert_eq!(&decoded[..4], &[b'e', 0, b'c', 0]);
+    }
+
+    #[test]
+    fn the_toast_variables_are_forwarded_through_wslenv() {
+        // WSL passes an environment variable to a Windows process only if it
+        // is named here. Without it PowerShell saw empty strings and the
+        // toast failed with "the parameter is incorrect: applicationId",
+        // silently, because the bell had already rung.
+        let wslenv = wslenv_with_toast_vars(None);
+        for var in TOAST_VARS {
+            assert!(wslenv.split(':').any(|part| part == var), "missing {var}");
+        }
+    }
+
+    #[test]
+    fn existing_wslenv_entries_are_kept() {
+        let wslenv = wslenv_with_toast_vars(Some("MY_PATH/p:OTHER"));
+        let parts: Vec<&str> = wslenv.split(':').collect();
+        assert!(parts.contains(&"MY_PATH/p"), "flags must survive: {wslenv}");
+        assert!(parts.contains(&"OTHER"));
+        assert!(parts.contains(&"RUSTCHAT_TOAST_BODY"));
+    }
+
+    #[test]
+    fn wslenv_entries_are_not_duplicated() {
+        let once = wslenv_with_toast_vars(Some("RUSTCHAT_TOAST_BODY"));
+        assert_eq!(
+            once.matches("RUSTCHAT_TOAST_BODY").count(),
+            1,
+            "should not be added twice: {once}"
+        );
+        // Even when the existing entry carries a flag.
+        let flagged = wslenv_with_toast_vars(Some("RUSTCHAT_TOAST_BODY/w"));
+        assert_eq!(flagged.matches("RUSTCHAT_TOAST_BODY").count(), 1);
+    }
+
+    #[test]
+    fn an_empty_wslenv_does_not_produce_empty_entries() {
+        let wslenv = wslenv_with_toast_vars(Some(""));
+        assert!(!wslenv.starts_with(':'), "{wslenv}");
+        assert!(!wslenv.contains("::"), "{wslenv}");
+    }
+
+    #[test]
+    fn powershell_errors_are_made_readable() {
+        let spew = concat!(
+            "#< CLIXML\n<Objs><S S=\"Error\">Exception calling \"CreateToastNotifier\" ",
+            "with \"1\" argument(s): \"The parameter is incorrect._x000D__x000A_</S>",
+            "<S S=\"Error\">applicationId\"_x000D__x000A_</S></Objs>"
+        );
+        let message = first_powershell_error(spew);
+        assert!(message.contains("CreateToastNotifier"), "got: {message}");
+        assert!(!message.contains("_x000D_"), "escapes should go: {message}");
+        assert!(!message.contains("<S "), "no xml should survive: {message}");
+    }
+
+    #[test]
+    fn an_unparseable_error_still_says_something() {
+        assert!(!first_powershell_error("").is_empty());
     }
 
     #[test]
