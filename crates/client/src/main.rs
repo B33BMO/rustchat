@@ -7,6 +7,7 @@
 //! See `rustchat-core` for the details.
 
 mod app;
+mod clipboard;
 mod headless;
 mod net;
 mod notify;
@@ -377,10 +378,8 @@ async fn chat(cli: Cli) -> Result<()> {
     // Focus reports are what let a mention notify only when you're elsewhere.
     // A terminal that doesn't support them just never sends any.
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableFocusChange);
-    // Mouse reporting is what lets hovering unscramble a message. It costs
-    // the terminal's own click-to-select, which most terminals give back
-    // with Shift held.
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
+    // The mouse itself is taken and released by the event loop, as
+    // `App::wants_mouse` says; this only makes sure a crash gives it back.
     release_mouse_on_panic();
     let result = run(&mut terminal, &mut app, cli, pending).await;
     let _ = crossterm::execute!(
@@ -503,8 +502,20 @@ async fn run(
     // Redraws on a timer as well as on input, so the status line and
     // reconnect messages stay current while nothing is being typed.
     let mut tick = tokio::time::interval(Duration::from_millis(250));
+    // Whether the mouse is captured. Capture costs the terminal's own
+    // click-and-drag selection, so it is held only while hovering has
+    // something to reveal, and given back the moment it doesn't.
+    let mut mouse_captured = false;
 
     loop {
+        if app.wants_mouse() != mouse_captured {
+            mouse_captured = !mouse_captured;
+            let _ = if mouse_captured {
+                crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)
+            } else {
+                crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture)
+            };
+        }
         terminal.draw(|frame| ui::draw(frame, app))?;
         if app.should_quit {
             break;
@@ -544,6 +555,24 @@ async fn run(
 
         if let Some(text) = app.alert.take() {
             notify::alert(&text);
+        }
+
+        if let Some((value, label)) = app.copy_request.take() {
+            match clipboard::copy(&value) {
+                clipboard::Copied::Confirmed => app.system(
+                    format!("Copied the {label} to your clipboard. Treat it as secret."),
+                    Level::Good,
+                ),
+                clipboard::Copied::Requested => app.system(
+                    format!(
+                        "Asked your terminal to copy the {label}. If nothing landed on the \
+                         clipboard, your terminal doesn't allow it — /{} shows it instead, \
+                         and /mouse off lets you select it.",
+                        if label == "invite" { "invite" } else { "key" }
+                    ),
+                    Level::Info,
+                ),
+            }
         }
 
         if std::mem::take(&mut app.notify_selftest) {

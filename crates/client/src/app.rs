@@ -315,6 +315,12 @@ pub struct App {
     pub share_typing: bool,
     /// When this client last told the room it was typing.
     last_typing_sent: i64,
+    /// Whether rustchat may take the mouse for hover-to-reveal. Off hands it
+    /// back to the terminal, so ordinary click-and-drag selection works.
+    pub mouse: bool,
+    /// Something to put on the clipboard, and what to call it. Taken by the
+    /// event loop, which owns stdout.
+    pub copy_request: Option<(String, &'static str)>,
 }
 
 impl App {
@@ -350,7 +356,17 @@ impl App {
             typing: HashMap::new(),
             share_typing: true,
             last_typing_sent: 0,
+            mouse: true,
+            copy_request: None,
         }
+    }
+
+    /// Whether the terminal's mouse should be captured right now. Only when
+    /// hovering has something to reveal: never on the setup and unlock
+    /// screens, where people paste and select invites, and not with
+    /// scrambling off, where capture would cost selection for nothing.
+    pub fn wants_mouse(&self) -> bool {
+        self.mouse && self.scramble_after.is_some() && matches!(self.screen, Screen::Chat)
     }
 
     /// Whether `entry` should be drawn scrambled at `now`, before any
@@ -1091,11 +1107,26 @@ impl App {
                 self.system(
                     "/invite one-paste invite · /key show the room key · /nick <name> rename \
                      · /who occupancy · /notify mentions|all|off|test · Ctrl-F search \
-                     · /scramble <seconds>|off · /typing on|off · /whoami your key \
+                     · /invite copy · /key copy · /scramble <seconds>|off · /mouse on|off \
+                     · /typing on|off · /whoami your key \
                      · /keys known keys · /trust <name> <fingerprint> \
                      · /clear wipe the view · /forget erase saved history · /quit",
                     Level::Info,
                 );
+                Action::None
+            }
+            "key" | "invite" if arg.eq_ignore_ascii_case("copy") => {
+                let (value, label) = if cmd == "key" {
+                    (self.room_key_display.clone(), "room key")
+                } else {
+                    (self.invite_display.clone(), "invite")
+                };
+                match value {
+                    // Copied without being shown: nothing for anyone looking
+                    // over your shoulder to read.
+                    Some(value) => self.copy_request = Some((value, label)),
+                    None => self.system(format!("No {label} to copy."), Level::Bad),
+                }
                 Action::None
             }
             "key" => {
@@ -1107,7 +1138,8 @@ impl App {
                         );
                         self.system(
                             "They also need this relay's access key — or use /invite, which \
-                             bundles both with the relay address.",
+                             bundles both with the relay address. /key copy puts it on your \
+                             clipboard.",
                             Level::Info,
                         );
                     }
@@ -1121,7 +1153,8 @@ impl App {
                         self.system(format!("Invite: {invite}"), Level::Warn);
                         self.system(
                             "One paste gets someone into this exact room. It contains both \
-                             keys, so treat it like the room key itself.",
+                             keys, so treat it like the room key itself. /invite copy puts it \
+                             on your clipboard without showing it.",
                             Level::Info,
                         );
                     }
@@ -1277,6 +1310,35 @@ impl App {
                     }
                     None => self.system("Usage: /scramble <seconds>|on|off", Level::Bad),
                 }
+                Action::None
+            }
+            "mouse" => {
+                match arg.to_ascii_lowercase().as_str() {
+                    "on" => self.mouse = true,
+                    "off" => {
+                        self.mouse = false;
+                        self.hover = None;
+                    }
+                    "" => {}
+                    _ => {
+                        self.system("Usage: /mouse on|off", Level::Bad);
+                        return Action::None;
+                    }
+                }
+                self.system(
+                    if self.mouse {
+                        "Mouse: rustchat's — hover to read scrambled messages, wheel to \
+                         scroll. Hold Shift to select text, or /mouse off."
+                    } else {
+                        "Mouse: the terminal's — select and copy as usual. Hovering won't \
+                         unscramble messages until /mouse on."
+                    },
+                    if arg.is_empty() {
+                        Level::Info
+                    } else {
+                        Level::Good
+                    },
+                );
                 Action::None
             }
             "typing" => {
@@ -2381,6 +2443,35 @@ mod tests {
         assert_eq!(app.vault.scramble, "off");
         app.run_command("scramble nonsense");
         assert_eq!(app.scramble_after, None, "a typo changes nothing");
+    }
+
+    #[test]
+    fn copying_an_invite_never_puts_it_on_screen() {
+        let mut app = app();
+        app.invite_display = Some("rcinv1-SECRET".into());
+        app.run_command("invite copy");
+        assert_eq!(
+            app.copy_request,
+            Some(("rcinv1-SECRET".to_string(), "invite"))
+        );
+        assert!(app.entries.is_empty(), "copied, not shown");
+    }
+
+    #[test]
+    fn the_mouse_is_only_taken_when_hovering_can_reveal_something() {
+        let mut app = app();
+        assert!(app.wants_mouse());
+        app.run_command("mouse off");
+        assert!(!app.wants_mouse());
+        app.run_command("mouse on");
+        app.run_command("scramble off");
+        assert!(!app.wants_mouse(), "nothing to reveal");
+        app.run_command("scramble on");
+        app.screen = Screen::Unlock(Unlock::new());
+        assert!(
+            !app.wants_mouse(),
+            "never while pasting or typing a passphrase"
+        );
     }
 
     #[test]

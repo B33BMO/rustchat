@@ -175,16 +175,19 @@ Type to talk. Enter sends.
 A minute after a message arrives, its letters scramble, so someone glancing at
 your screen sees the shape of a conversation but not the words. Hover over a
 message to read it. The one a search lands on shows too. History you load or
-catch up on arrives already scrambled. rustchat captures the mouse to see
-where you're hovering, so to select text with the mouse, hold `Shift` (or
-`Option` in iTerm2). In tmux, hovering needs `set -g mouse on`.
+catch up on arrives already scrambled. To see where you're hovering,
+rustchat captures the mouse in the chat screen, so to select text there, hold
+`Shift` (or `Option` in iTerm2), or `/mouse off` to hand the mouse back. In
+tmux, hovering needs `set -g mouse on`. To hand someone an invite, `/invite
+copy` puts it straight on your clipboard without showing it.
 
 When someone is typing, the bottom edge of the input box says so.
 
 | Command | |
 |---|---|
 | `/invite` | one-paste invite for this room |
-| `/key` | show just the room key |
+| `/invite copy` | put the invite on your clipboard, without showing it |
+| `/key` | show just the room key (`/key copy` to copy it) |
 | `/nick <name>` | change your name |
 | `/whoami` | your signing key's fingerprint |
 | `/keys` | the keys you trust, per name |
@@ -195,6 +198,7 @@ When someone is typing, the bottom edge of the input box says so.
 | `/notify test` | fire one now and report whether it worked |
 | `/scramble <seconds>\|off` | when messages scramble (default: 60s) |
 | `/typing on\|off` | whether the room sees when you're typing |
+| `/mouse on\|off` | off hands the mouse back to the terminal for selecting text |
 | `/clear` | wipe the view |
 | `/forget` | erase saved history from your vault |
 | `/quit` | leave |

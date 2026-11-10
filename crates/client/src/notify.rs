@@ -188,7 +188,7 @@ fn desktop_notifications_available() -> bool {
 }
 
 /// Whether we are running inside WSL.
-fn running_under_wsl() -> bool {
+pub fn running_under_wsl() -> bool {
     if std::env::var_os("WSL_INTEROP").is_some() || std::env::var_os("WSL_DISTRO_NAME").is_some() {
         return true;
     }
