@@ -1,10 +1,10 @@
 //! Client state and key handling. Knows nothing about drawing or sockets.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use rustchat_core::identity::{PUBLIC_BYTES, fingerprint, fingerprint_matches};
 use rustchat_core::vault::{StoredLine, VaultData};
 use rustchat_core::{AccessKey, Invite, Payload, RoomKey, Signer, proto};
@@ -31,17 +31,22 @@ pub enum Entry {
         trust: Trust,
         /// The key that signed it, if any signature checked out.
         key: Option<PublicKey>,
+        /// When it reached this screen, in local Unix milliseconds — what the
+        /// scramble timer counts from. Not `ts`: that is the sender's clock,
+        /// and a sender whose clock is off would otherwise decide how long
+        /// their message stays readable on yours.
+        seen_at: i64,
     },
     Presence {
         user: String,
         joined: bool,
         ts: i64,
+        /// The key that signed the announcement, so the name is drawn in the
+        /// same color as that sender's messages.
+        key: Option<PublicKey>,
     },
     /// Local commentary — connection state, command output, errors.
-    System {
-        body: String,
-        level: Level,
-    },
+    System { body: String, level: Level },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +102,24 @@ impl Notify {
             Self::Off => "off",
         }
     }
+}
+
+/// How long a message stays readable before it scrambles, by default.
+pub const DEFAULT_SCRAMBLE_MS: i64 = 60_000;
+
+/// How often to tell the room you're still typing. Receivers give up on an
+/// indicator after [`TYPING_LAPSE_MS`], which has to comfortably exceed this
+/// or the indicator flickers between repeats.
+const TYPING_EVERY_MS: i64 = 3_000;
+/// How long an indicator lasts without a repeat.
+pub const TYPING_LAPSE_MS: i64 = 6_000;
+
+/// Someone the room says is typing.
+#[derive(Debug, Clone, Copy)]
+pub struct Typist {
+    /// Local time the last indicator arrived.
+    pub at: i64,
+    pub key: Option<PublicKey>,
 }
 
 /// An open `Ctrl-F` search over the transcript.
@@ -278,6 +301,20 @@ pub struct App {
     seen_keys: std::collections::HashMap<String, Vec<PublicKey>>,
     /// Warnings already shown, so an impostor doesn't bury the room in them.
     warned: HashSet<(String, Option<PublicKey>)>,
+    /// Where the mouse pointer is, as (column, row), while it's over the
+    /// window. The message under it is shown unscrambled.
+    pub hover: Option<(u16, u16)>,
+    /// Milliseconds after arriving that a message scrambles; `None` is off.
+    pub scramble_after: Option<i64>,
+    /// Random per launch, mixed into the scramble so the jumbled text isn't
+    /// a fixed function of the message.
+    pub scramble_salt: u64,
+    /// Who's typing, by name.
+    pub typing: HashMap<String, Typist>,
+    /// Whether to tell the room when you're typing.
+    pub share_typing: bool,
+    /// When this client last told the room it was typing.
+    last_typing_sent: i64,
 }
 
 impl App {
@@ -307,7 +344,76 @@ impl App {
             identity: None,
             seen_keys: Default::default(),
             warned: HashSet::new(),
+            hover: None,
+            scramble_after: Some(DEFAULT_SCRAMBLE_MS),
+            scramble_salt: random_u64(),
+            typing: HashMap::new(),
+            share_typing: true,
+            last_typing_sent: 0,
         }
+    }
+
+    /// Whether `entry` should be drawn scrambled at `now`, before any
+    /// hovering is taken into account. Only chat lines ever are: system lines
+    /// are the app talking to you, and presence is just a name.
+    pub fn is_scrambled(&self, entry: &Entry, now: i64) -> bool {
+        match (entry, self.scramble_after) {
+            (Entry::Msg { seen_at, .. }, Some(after)) => now.saturating_sub(*seen_at) >= after,
+            _ => false,
+        }
+    }
+
+    /// Names typing as of `now`, longest-typing first, leaving out anyone
+    /// whose indicator has lapsed.
+    pub fn typists(&self, now: i64) -> Vec<(&str, Typist)> {
+        let mut out: Vec<(&str, Typist)> = self
+            .typing
+            .iter()
+            .filter(|(_, t)| now.saturating_sub(t.at) < TYPING_LAPSE_MS)
+            .map(|(name, t)| (name.as_str(), *t))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(b.0));
+        out
+    }
+
+    /// Mouse movement and the wheel. Movement only records where the pointer
+    /// is; the renderer works out which message that lands on, since only it
+    /// knows the layout.
+    pub fn on_mouse(&mut self, event: MouseEvent) {
+        if !matches!(self.screen, Screen::Chat) {
+            return;
+        }
+        match event.kind {
+            MouseEventKind::Moved | MouseEventKind::Drag(_) | MouseEventKind::Down(_) => {
+                self.hover = Some((event.column, event.row));
+            }
+            // Capturing the mouse takes the wheel away from the terminal, so
+            // it has to be handled here or scrolling back would stop working.
+            MouseEventKind::ScrollUp if self.search.is_none() => {
+                self.scroll = self.scroll.saturating_add(3);
+            }
+            MouseEventKind::ScrollDown if self.search.is_none() => {
+                self.scroll = self.scroll.saturating_sub(3);
+            }
+            _ => {}
+        }
+    }
+
+    /// A typing indicator to send for the draft as it now stands, if one is
+    /// due. Commands don't count: `/key` is not something to announce.
+    fn typing_signal(&mut self) -> Action {
+        if !self.share_typing || self.input.trim().is_empty() || self.input.starts_with('/') {
+            return Action::None;
+        }
+        let now = proto::now_ms();
+        if now.saturating_sub(self.last_typing_sent) < TYPING_EVERY_MS {
+            return Action::None;
+        }
+        self.last_typing_sent = now;
+        Action::Send(Payload::Typing {
+            user: self.username.clone(),
+            ts: now,
+        })
     }
 
     /// Decides how far to trust a message under `user` with this signature.
@@ -478,6 +584,7 @@ impl App {
         ts: i64,
         trust: Trust,
         key: Option<PublicKey>,
+        seen_at: i64,
     ) {
         // Only a line from before signing falls back on the name; an
         // unsigned line under your name now is someone else's.
@@ -491,6 +598,7 @@ impl App {
             mention,
             trust,
             key,
+            seen_at,
         });
     }
 
@@ -541,11 +649,33 @@ impl App {
         }
         match payload {
             Payload::Msg { user, body, ts } => {
+                let now = proto::now_ms();
+                // Replayed lines count as seen when they were sent, so old
+                // ones arrive already scrambled instead of all lingering
+                // readable for a minute after you connect.
+                let seen_at = if from_history { ts.min(now) } else { now };
                 if !from_history {
                     self.maybe_alert(&user, &body, trust == Trust::Own);
                     self.remember(&user, &body, ts, signer);
+                    // They sent it, so they've stopped typing it.
+                    self.typing.remove(&user);
                 }
-                self.push_msg(user, body, ts, trust, key);
+                self.push_msg(user, body, ts, trust, key, seen_at);
+            }
+            // Your own echo is ignored, and so is a forgery: anyone in the
+            // room could otherwise make it look like anyone else is typing.
+            Payload::Typing { user, .. }
+                if !from_history && !matches!(trust, Trust::Own | Trust::Forged) =>
+            {
+                self.typing.insert(
+                    user,
+                    Typist {
+                        at: proto::now_ms(),
+                        key,
+                    },
+                );
+                // Not a transcript line, so there's nothing to trim.
+                return;
             }
             // Presence is noise in a replayed backlog: "bmo joined" from two
             // hours ago tells you nothing about who is here now. Your own
@@ -556,13 +686,16 @@ impl App {
                     user,
                     joined: true,
                     ts,
+                    key,
                 });
             }
             Payload::Leave { user, ts } if !from_history && user != self.username => {
+                self.typing.remove(&user);
                 self.entries.push(Entry::Presence {
                     user,
                     joined: false,
                     ts,
+                    key,
                 });
             }
             _ => return,
@@ -626,7 +759,8 @@ impl App {
             };
             self.warn_about(&user, trust, key);
             self.remember(&user, &body, ts, signer);
-            self.push_msg(user, body, ts, trust, key);
+            let seen_at = ts.min(proto::now_ms());
+            self.push_msg(user, body, ts, trust, key, seen_at);
         }
         self.trim();
     }
@@ -654,7 +788,8 @@ impl App {
         );
         for line in lines {
             let (trust, key) = self.stored_trust(&line);
-            self.push_msg(line.user, line.body, line.ts, trust, key);
+            let seen_at = line.ts.min(proto::now_ms());
+            self.push_msg(line.user, line.body, line.ts, trust, key, seen_at);
         }
     }
 
@@ -870,6 +1005,7 @@ impl App {
                 self.cursor += 1;
                 // Typing means you want to see what you're replying to.
                 self.scroll = 0;
+                return self.typing_signal();
             }
             KeyCode::Backspace => {
                 if self.cursor > 0 {
@@ -955,7 +1091,8 @@ impl App {
                 self.system(
                     "/invite one-paste invite · /key show the room key · /nick <name> rename \
                      · /who occupancy · /notify mentions|all|off|test · Ctrl-F search \
-                     · /whoami your key · /keys known keys · /trust <name> <fingerprint> \
+                     · /scramble <seconds>|off · /typing on|off · /whoami your key \
+                     · /keys known keys · /trust <name> <fingerprint> \
                      · /clear wipe the view · /forget erase saved history · /quit",
                     Level::Info,
                 );
@@ -1101,6 +1238,71 @@ impl App {
                     }
                     None => self.system("Usage: /notify mentions|all|off|test", Level::Bad),
                 }
+                Action::None
+            }
+            "scramble" => {
+                if arg.is_empty() {
+                    let state = match self.scramble_after {
+                        Some(ms) => format!("after {}", seconds(ms)),
+                        None => "off".into(),
+                    };
+                    self.system(
+                        format!(
+                            "Scrambling: {state}. Hover a message to read it. \
+                             /scramble <seconds> or /scramble off to change."
+                        ),
+                        Level::Info,
+                    );
+                    return Action::None;
+                }
+                match parse_scramble(&arg) {
+                    Some(after) => {
+                        self.scramble_after = after;
+                        self.vault.scramble = match after {
+                            None => "off".into(),
+                            Some(DEFAULT_SCRAMBLE_MS) => String::new(),
+                            Some(ms) => (ms / 1000).to_string(),
+                        };
+                        self.system(
+                            match after {
+                                Some(ms) => format!(
+                                    "Messages scramble {} after they arrive. Hover one to \
+                                     read it.",
+                                    seconds(ms)
+                                ),
+                                None => "Scrambling off — messages stay readable.".into(),
+                            },
+                            Level::Good,
+                        );
+                    }
+                    None => self.system("Usage: /scramble <seconds>|on|off", Level::Bad),
+                }
+                Action::None
+            }
+            "typing" => {
+                match arg.to_ascii_lowercase().as_str() {
+                    "on" => self.share_typing = true,
+                    "off" => self.share_typing = false,
+                    "" => {}
+                    _ => {
+                        self.system("Usage: /typing on|off", Level::Bad);
+                        return Action::None;
+                    }
+                }
+                self.vault.hide_typing = !self.share_typing;
+                self.system(
+                    if self.share_typing {
+                        "Typing indicator: on — the room sees when you're typing. \
+                         /typing off to stop."
+                    } else {
+                        "Typing indicator: off — you still see others, they don't see you."
+                    },
+                    if arg.is_empty() {
+                        Level::Info
+                    } else {
+                        Level::Good
+                    },
+                );
                 Action::None
             }
             "forget" => {
@@ -1348,6 +1550,39 @@ pub fn mentions(body: &str, name: &str) -> bool {
             .next()
             .is_none_or(|c| !(c.is_alphanumeric() || c == '_' || c == '-'))
     })
+}
+
+/// Reads a `/scramble` argument or a saved setting: `Some(None)` is off,
+/// `Some(Some(ms))` is a delay, `None` is nonsense.
+pub fn parse_scramble(raw: &str) -> Option<Option<i64>> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "on" => Some(Some(DEFAULT_SCRAMBLE_MS)),
+        "off" | "none" => Some(None),
+        n => {
+            let secs: i64 = n.trim_end_matches('s').parse().ok()?;
+            // Zero would scramble a line before anyone could read it; a day
+            // is far past the point of being a shoulder-surfing guard.
+            (1..=86_400).contains(&secs).then_some(Some(secs * 1000))
+        }
+    }
+}
+
+/// `90000` as "90s", `60000` as "1 minute".
+fn seconds(ms: i64) -> String {
+    match ms / 1000 {
+        60 => "1 minute".into(),
+        s if s % 60 == 0 => format!("{} minutes", s / 60),
+        s => format!("{s}s"),
+    }
+}
+
+/// A random 64-bit value, without pulling in an RNG crate: std seeds every
+/// `RandomState` from the OS.
+fn random_u64() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u64(proto::now_ms() as u64);
+    hasher.finish()
 }
 
 /// Byte offset of character `index`, or the end of the string.
@@ -2050,6 +2285,120 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    fn typing(user: &str) -> Payload {
+        Payload::Typing {
+            user: user.into(),
+            ts: 0,
+        }
+    }
+
+    #[test]
+    fn typing_a_message_tells_the_room_but_not_on_every_key() {
+        let mut app = app();
+        let first = app.on_key(key(KeyCode::Char('h')));
+        assert!(
+            matches!(first, Action::Send(Payload::Typing { ref user, .. }) if user == "bmo"),
+            "{first:?}"
+        );
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('i'))),
+            Action::None,
+            "throttled"
+        );
+    }
+
+    #[test]
+    fn commands_and_opting_out_send_no_typing() {
+        let mut app = app();
+        assert_eq!(app.on_key(key(KeyCode::Char('/'))), Action::None);
+        type_keys(&mut app, "key");
+        assert_eq!(app.on_key(key(KeyCode::Char('x'))), Action::None);
+
+        let mut app = self::app();
+        app.run_command("typing off");
+        assert!(app.vault.hide_typing, "saved");
+        assert_eq!(app.on_key(key(KeyCode::Char('h'))), Action::None);
+    }
+
+    #[test]
+    fn someone_typing_shows_until_they_send() {
+        let mut app = app();
+        app.absorb(signed_by([1; 32], typing("sam")), false);
+        let now = proto::now_ms();
+        assert_eq!(app.typists(now).len(), 1);
+        assert!(app.entries.is_empty(), "not a transcript line");
+        app.absorb(signed_by([1; 32], said("sam", "done", 1)), false);
+        assert!(app.typists(now).is_empty());
+    }
+
+    #[test]
+    fn your_own_and_forged_typing_are_ignored() {
+        let mut app = app();
+        app.absorb(signed_by(ME, typing("bmo")), false);
+        app.absorb(
+            Incoming {
+                payload: typing("sam"),
+                signer: Signer::Invalid,
+            },
+            false,
+        );
+        assert!(app.typists(proto::now_ms()).is_empty());
+    }
+
+    #[test]
+    fn replayed_lines_arrive_already_old() {
+        let mut app = app();
+        app.absorb_backlog(vec![said("sam", "from yesterday", 1)]);
+        let now = proto::now_ms();
+        let line = app.entries.last().unwrap();
+        assert!(app.is_scrambled(line, now), "old history starts scrambled");
+
+        app.absorb(said("sam", "just now", 1), false);
+        let line = app.entries.last().unwrap();
+        assert!(
+            !app.is_scrambled(line, now),
+            "a live line gets its minute, whatever the sender's clock says"
+        );
+    }
+
+    #[test]
+    fn scramble_settings_parse_and_save() {
+        assert_eq!(parse_scramble(""), Some(Some(DEFAULT_SCRAMBLE_MS)));
+        assert_eq!(parse_scramble("off"), Some(None));
+        assert_eq!(parse_scramble("30"), Some(Some(30_000)));
+        assert_eq!(parse_scramble("30s"), Some(Some(30_000)));
+        assert_eq!(parse_scramble("0"), None);
+        assert_eq!(parse_scramble("soon"), None);
+
+        let mut app = app();
+        app.run_command("scramble 30");
+        assert_eq!(app.scramble_after, Some(30_000));
+        assert_eq!(app.vault.scramble, "30");
+        app.run_command("scramble off");
+        assert_eq!(app.scramble_after, None);
+        assert_eq!(app.vault.scramble, "off");
+        app.run_command("scramble nonsense");
+        assert_eq!(app.scramble_after, None, "a typo changes nothing");
+    }
+
+    #[test]
+    fn the_mouse_wheel_scrolls() {
+        use crossterm::event::MouseEvent;
+        let mut app = app();
+        let wheel = |kind| MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.on_mouse(wheel(MouseEventKind::ScrollUp));
+        assert_eq!(app.scroll, 3);
+        app.on_mouse(wheel(MouseEventKind::ScrollDown));
+        assert_eq!(app.scroll, 0);
+        app.on_mouse(wheel(MouseEventKind::Moved));
+        assert_eq!(app.hover, Some((0, 0)));
     }
 
     #[test]

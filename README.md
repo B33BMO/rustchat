@@ -168,7 +168,18 @@ Type to talk. Enter sends.
 | `Ctrl-U` | clear the line |
 | `Ctrl-L` | clear the view |
 | `Ctrl-F` | search the transcript — `↑`/`Enter` older, `↓` newer, `Esc` done |
+| mouse wheel | scroll the transcript |
+| hover | read a scrambled message |
 | `Ctrl-C` | quit |
+
+A minute after a message arrives, its letters scramble, so someone glancing at
+your screen sees the shape of a conversation but not the words. Hover over a
+message to read it. The one a search lands on shows too. History you load or
+catch up on arrives already scrambled. rustchat captures the mouse to see
+where you're hovering, so to select text with the mouse, hold `Shift` (or
+`Option` in iTerm2). In tmux, hovering needs `set -g mouse on`.
+
+When someone is typing, the bottom edge of the input box says so.
 
 | Command | |
 |---|---|
@@ -182,6 +193,8 @@ Type to talk. Enter sends.
 | `/who` | how many connections are in the room |
 | `/notify mentions\|all\|off` | when to ring and notify (default: `@you` only) |
 | `/notify test` | fire one now and report whether it worked |
+| `/scramble <seconds>\|off` | when messages scramble (default: 60s) |
+| `/typing on\|off` | whether the room sees when you're typing |
 | `/clear` | wipe the view |
 | `/forget` | erase saved history from your vault |
 | `/quit` | leave |
@@ -296,6 +309,11 @@ matches, `/trust <name> <fingerprint>`. Your own name is never trusted on
 first sight, so anything posted as you from a key that isn't this device's is
 flagged — including your own second device, until you `/trust` it.
 
+Names are colored by the key that signed them, not by the name itself. So
+someone borrowing a name doesn't get its color, and someone on two devices
+shows in two colors. Your own lines are always in your own color, which nobody
+else's can come close to.
+
 This can't catch an impostor who was there *first*, and it can't stop someone
 from posting under a name nobody has used yet. What it does is make a change
 visible, which is the attack that matters in a room of people who already
@@ -375,6 +393,10 @@ Worth being straight about:
 - **Traffic analysis.** The relay sees who connects from where, when, which
   room id they joined, and how big each message is. Room ids are stable, so it
   can tell that the same room is being used again — just not what's in it.
+  Typing indicators go to the relay as their own kind of message, so it can
+  also see *when* someone is typing. `/typing off` stops sending them.
+- **Shoulder surfing, fully.** Scrambling hides old messages, but not the
+  newest minute, names, the shape of the text, or whatever is under the mouse.
 - **No forward secrecy.** One long-lived key. Someone who records ciphertext
   today and gets the key later can read it all. A ratchet would fix this and
   would also break "hand out one key and anyone can join", which is the point.

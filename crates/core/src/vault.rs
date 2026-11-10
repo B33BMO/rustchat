@@ -72,6 +72,13 @@ pub struct VaultData {
     /// Keys trusted for each name: base64 public keys, first-seen first.
     #[serde(default)]
     pub known_keys: std::collections::BTreeMap<String, Vec<String>>,
+    /// When messages scramble: seconds after arrival, "off", or empty for the
+    /// default.
+    #[serde(default)]
+    pub scramble: String,
+    /// Set to stop telling the room when you're typing.
+    #[serde(default)]
+    pub hide_typing: bool,
 }
 
 impl VaultData {
@@ -208,6 +215,8 @@ mod tests {
             notify: "all".into(),
             identity_b64: "cccc".into(),
             known_keys: [("sam".to_string(), vec!["dddd".to_string()])].into(),
+            scramble: "off".into(),
+            hide_typing: true,
         }
     }
 

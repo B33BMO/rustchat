@@ -828,3 +828,54 @@ fn rand_suffix() -> u64 {
         .unwrap()
         .as_nanos() as u64
 }
+
+#[tokio::test]
+async fn signals_reach_the_room_but_never_the_backlog() {
+    // A typing indicator replayed to a late joiner is noise, and each one
+    // kept would push a real line out of the bounded backlog.
+    let access = AccessKey::generate();
+    let key = RoomKey::generate();
+    let relay = start_relay(&access.auth_hex(), 200).await;
+
+    let mut alice = join(&relay.url, &access, &key).await;
+    let mut bob = join(&relay.url, &access, &key).await;
+    send(
+        &mut alice,
+        &ClientMsg::Signal {
+            env: sealed(&key, "alice", "typing"),
+        },
+    )
+    .await;
+    let forwarded = loop {
+        match next_msg(&mut bob).await {
+            Some(RelayMsg::Msg { env }) => break open_envelope(&key, &env),
+            Some(RelayMsg::Occupants { .. }) => continue,
+            other => panic!("expected the signal, got {other:?}"),
+        }
+    };
+    assert!(matches!(forwarded, Payload::Msg { ref body, .. } if body == "typing"));
+
+    send(
+        &mut alice,
+        &ClientMsg::Send {
+            env: sealed(&key, "alice", "a real line"),
+        },
+    )
+    .await;
+    // Wait for the echo, so the real line is recorded before anyone joins.
+    loop {
+        if let Some(RelayMsg::Msg { env }) = next_msg(&mut alice).await
+            && matches!(open_envelope(&key, &env), Payload::Msg { ref body, .. } if body == "a real line")
+        {
+            break;
+        }
+    }
+
+    let mut carol = join(&relay.url, &access, &key).await;
+    let envs = history_of(&mut carol).await;
+    assert_eq!(envs.len(), 1, "only the real line is kept");
+    assert!(matches!(
+        open_envelope(&key, &envs[0]),
+        Payload::Msg { ref body, .. } if body == "a real line"
+    ));
+}

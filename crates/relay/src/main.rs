@@ -620,6 +620,19 @@ async fn serve_socket(socket: WebSocket, state: Arc<AppState>) -> Result<()> {
                                 // ordering without any sequence numbers.
                                 let _ = room.tx.send(Broadcast::Envelope(env));
                             }
+                            // Forwarded like a Send but never recorded: a
+                            // typing indicator replayed to someone joining an
+                            // hour later is noise, and every one recorded
+                            // would push a real line out of the backlog. Over
+                            // the rate limit it is dropped quietly rather than
+                            // answered with "slow down", which is meant for a
+                            // person and would only confuse one here.
+                            ClientMsg::Signal { env } => {
+                                if !bucket.take() || envelope_bytes(&env) > MAX_ENVELOPE_BYTES {
+                                    continue;
+                                }
+                                let _ = room.tx.send(Broadcast::Envelope(env));
+                            }
                             ClientMsg::Ping => send(&mut sink, &RelayMsg::Pong).await?,
                             ClientMsg::Auth { .. } => {} // Already past that.
                         }

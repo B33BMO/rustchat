@@ -17,15 +17,23 @@ const BAD: Color = Color::Rgb(231, 111, 81);
 const GOOD: Color = Color::Rgb(146, 209, 125);
 const WARN: Color = Color::Rgb(240, 200, 110);
 
-/// Colors usernames are drawn in, chosen by hashing the name so that the same
-/// person keeps the same color for everyone in the room.
-const NAME_COLORS: [Color; 6] = [
-    Color::Rgb(129, 184, 239),
-    Color::Rgb(197, 154, 232),
-    Color::Rgb(126, 231, 209),
-    Color::Rgb(232, 165, 196),
-    Color::Rgb(159, 214, 138),
-    Color::Rgb(238, 186, 128),
+/// Colors other people's names are drawn in. Spread around the wheel, and
+/// kept clear of the colors that already mean something here: nothing near
+/// [`OWN`], so nobody else can look like you, and nothing near [`WARN`] or
+/// [`BAD`], so a name never reads as an alert.
+const NAME_COLORS: [Color; 12] = [
+    Color::Rgb(122, 170, 247), // blue
+    Color::Rgb(160, 160, 250), // periwinkle
+    Color::Rgb(196, 148, 240), // violet
+    Color::Rgb(230, 140, 220), // magenta
+    Color::Rgb(245, 150, 185), // pink
+    Color::Rgb(215, 170, 230), // orchid
+    Color::Rgb(190, 225, 110), // lime
+    Color::Rgb(130, 215, 130), // green
+    Color::Rgb(100, 200, 160), // sea green
+    Color::Rgb(110, 205, 235), // cyan
+    Color::Rgb(150, 190, 215), // steel
+    Color::Rgb(200, 210, 160), // sage
 ];
 
 /// Left margin for message bodies, in columns.
@@ -55,7 +63,8 @@ fn draw_chat(frame: &mut Frame, app: &App) {
     // to Paragraph's own wrapping, because scrolling needs to be in units of
     // *rendered* lines for the view to move predictably.
     let width = body.width.saturating_sub(1) as usize;
-    let (lines, starts) = build_transcript(app, width.max(8));
+    let now = rustchat_core::proto::now_ms();
+    let (mut lines, starts) = build_transcript(app, width.max(8), now, None);
     let height = body.height as usize;
     let max_scroll = lines.len().saturating_sub(height);
     // While searching, the view follows the match rather than the scroll
@@ -71,6 +80,21 @@ fn draw_chat(frame: &mut Frame, app: &App) {
     let scroll = wanted.min(max_scroll);
     let start = lines.len().saturating_sub(height + scroll);
     let end = lines.len().saturating_sub(scroll);
+
+    // Unscrambling the message under the pointer changes no line breaks
+    // (see `build_transcript`), so the layout just drawn says which message
+    // that is, and drawing it again with that one revealed moves nothing.
+    let hovered = app
+        .hover
+        .filter(|&(x, y)| x >= body.x && x < body.right() && y >= body.y && y < body.bottom())
+        .map(|(_, y)| start + (y - body.y) as usize)
+        .filter(|&line| line < end)
+        .map(|line| starts.partition_point(|&s| s <= line).saturating_sub(1));
+    if let Some(entry) = hovered
+        && app.is_scrambled(&app.entries[entry], now)
+    {
+        lines = build_transcript(app, width.max(8), now, Some(entry)).0;
+    }
     let window: Vec<Line> = lines[start..end].to_vec();
 
     frame.render_widget(Paragraph::new(window), body);
@@ -132,10 +156,15 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App, scrolled: bool) {
         None if app.input.starts_with('/') => (" command ", DIM, app.input.as_str(), app.cursor),
         None => (" message ", DIM, app.input.as_str(), app.cursor),
     };
-    let block = Block::bordered()
+    let mut block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(border))
         .title_top(Span::styled(title, Style::default().fg(DIM)));
+    if app.search.is_none()
+        && let Some(line) = typing_line(app, rustchat_core::proto::now_ms())
+    {
+        block = block.title_bottom(line);
+    }
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -152,9 +181,53 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App, scrolled: bool) {
     ));
 }
 
+/// "sam is typing…", for the bottom edge of the input box, or nothing.
+fn typing_line(app: &App, now: i64) -> Option<Line<'static>> {
+    let typists = app.typists(now);
+    let dim = Style::default().fg(DIM).add_modifier(Modifier::ITALIC);
+    let name = |(user, t): &(&str, crate::app::Typist)| {
+        Span::styled(
+            user.to_string(),
+            Style::default()
+                .fg(name_color(user, t.key))
+                .add_modifier(Modifier::ITALIC),
+        )
+    };
+    let mut spans = vec![Span::styled(" ", dim)];
+    match typists.as_slice() {
+        [] => return None,
+        [one] => {
+            spans.push(name(one));
+            spans.push(Span::styled(" is typing… ", dim));
+        }
+        [a, b] => {
+            spans.push(name(a));
+            spans.push(Span::styled(" and ", dim));
+            spans.push(name(b));
+            spans.push(Span::styled(" are typing… ", dim));
+        }
+        many => spans.push(Span::styled(
+            format!("{} people are typing… ", many.len()),
+            dim,
+        )),
+    }
+    Some(Line::from(spans))
+}
+
 /// Renders the transcript into exactly-wrapped lines, oldest first, along
 /// with the line each entry starts on (so a search can scroll to one).
-fn build_transcript(app: &App, width: usize) -> (Vec<Line<'static>>, Vec<usize>) {
+///
+/// Chat lines older than the scramble delay come out jumbled, except the one
+/// at `reveal` (under the mouse) and the one a search is sitting on. A body
+/// is wrapped *before* it is scrambled, so scrambled or not it breaks into
+/// the same lines — which is what lets hovering reveal a message without
+/// anything on screen shifting.
+fn build_transcript(
+    app: &App,
+    width: usize,
+    now: i64,
+    reveal: Option<usize>,
+) -> (Vec<Line<'static>>, Vec<usize>) {
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut starts = Vec::with_capacity(app.entries.len());
     let query = app
@@ -181,13 +254,16 @@ fn build_transcript(app: &App, width: usize) -> (Vec<Line<'static>>, Vec<usize>)
                 mention,
                 trust,
                 key,
+                ..
             } => {
+                let hidden =
+                    app.is_scrambled(entry, now) && reveal != Some(index) && focus != Some(index);
                 let speaker = (user.clone(), *key, *trust);
                 if last_speaker.as_ref() != Some(&speaker) {
                     if !out.is_empty() {
                         out.push(Line::default());
                     }
-                    let color = if *own { OWN } else { name_color(user) };
+                    let color = if *own { OWN } else { name_color(user, *key) };
                     let mut spans = vec![Span::styled(
                         user.clone(),
                         Style::default().fg(color).add_modifier(Modifier::BOLD),
@@ -215,16 +291,29 @@ fn build_transcript(app: &App, width: usize) -> (Vec<Line<'static>>, Vec<usize>)
                 } else {
                     Span::raw(" ".repeat(BODY_INDENT))
                 };
-                for chunk in wrap(body, width.saturating_sub(BODY_INDENT)) {
+                let seed = scramble_seed(app.scramble_salt, user, *ts, body);
+                for (n, chunk) in wrap(body, width.saturating_sub(BODY_INDENT))
+                    .into_iter()
+                    .enumerate()
+                {
                     let mut spans = vec![gutter.clone()];
                     match query {
+                        _ if hidden => spans.push(Span::styled(
+                            scramble(&chunk, seed.wrapping_add(n as u64)),
+                            Style::default().fg(DIM),
+                        )),
                         Some(q) => spans.extend(highlight(&chunk, q, focus == Some(index))),
                         None => spans.push(Span::raw(chunk)),
                     }
                     out.push(Line::from(spans));
                 }
             }
-            Entry::Presence { user, joined, ts } => {
+            Entry::Presence {
+                user,
+                joined,
+                ts,
+                key,
+            } => {
                 last_speaker = None;
                 let (arrow, verb) = if *joined {
                     ("→", "joined")
@@ -233,7 +322,7 @@ fn build_transcript(app: &App, width: usize) -> (Vec<Line<'static>>, Vec<usize>)
                 };
                 out.push(Line::from(vec![
                     Span::styled(format!(" {arrow} "), Style::default().fg(DIM)),
-                    Span::styled(user.clone(), Style::default().fg(name_color(user))),
+                    Span::styled(user.clone(), Style::default().fg(name_color(user, *key))),
                     Span::styled(format!(" {verb}  {}", clock(*ts)), Style::default().fg(DIM)),
                 ]));
             }
@@ -714,12 +803,78 @@ fn char_at_width(s: &str, cols: usize) -> usize {
     s.chars().count()
 }
 
-/// Stable per-name color, so the same person looks the same to everybody.
-fn name_color(name: &str) -> Color {
-    let hash = name
-        .bytes()
-        .fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u32));
-    NAME_COLORS[(hash as usize) % NAME_COLORS.len()]
+/// The color a sender's name is drawn in, the same on every screen in the
+/// room.
+///
+/// Taken from the signing key when there is one, not the name. Names are
+/// free for anyone to type, so a color from the name would hand an impostor
+/// the real person's color along with their name; a key's color can only be
+/// had by holding the key. The cost is that someone on two devices shows in
+/// two colors, which is honest — they are two keys. Unsigned lines, from
+/// older clients, fall back on the name.
+fn name_color(name: &str, key: Option<[u8; 32]>) -> Color {
+    let hash = match key {
+        // A public key is already uniformly random; its first bytes will do.
+        Some(pk) => u64::from_le_bytes(pk[..8].try_into().expect("8 bytes")),
+        None => fnv1a(name.as_bytes()),
+    };
+    NAME_COLORS[(hash % NAME_COLORS.len() as u64) as usize]
+}
+
+fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |acc, &b| {
+        (acc ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+/// A per-message seed for [`scramble`], so each message jumbles differently
+/// but the same way every frame — it would flicker otherwise.
+fn scramble_seed(salt: u64, user: &str, ts: i64, body: &str) -> u64 {
+    let mut bytes = Vec::with_capacity(user.len() + body.len() + 17);
+    bytes.extend_from_slice(&salt.to_le_bytes());
+    bytes.extend_from_slice(user.as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(&ts.to_le_bytes());
+    bytes.extend_from_slice(body.as_bytes());
+    fnv1a(&bytes)
+}
+
+/// Jumbles `text` beyond reading while keeping its shape: every letter,
+/// digit and symbol becomes a random one of the same kind and width, while
+/// spaces and plain punctuation stay put.
+///
+/// Replaced rather than shuffled. Shuffling a message's own letters leaves
+/// "ok" a coin-flip from readable and "lol" as "oll", and long words are
+/// famously still legible with their middles mixed up.
+fn scramble(text: &str, seed: u64) -> String {
+    // splitmix64: tiny, and plenty for a visual effect.
+    let mut state = seed;
+    let mut next = move |n: u32| {
+        state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        ((z ^ (z >> 31)) % n as u64) as u32
+    };
+    let pick = |base: char, offset: u32| char::from_u32(base as u32 + offset).unwrap_or(base);
+    text.chars()
+        .filter_map(|c| {
+            if c.is_whitespace() || c.is_ascii_punctuation() {
+                return Some(c);
+            }
+            Some(match char_width(c) {
+                // Combining marks and the like: no column of their own, and
+                // nothing sensible to stand in for them.
+                0 => return None,
+                1 if c.is_ascii_digit() => pick('0', next(10)),
+                1 if c.is_uppercase() => pick('A', next(26)),
+                1 => pick('a', next(26)),
+                // Wide characters — CJK, most emoji — become fullwidth
+                // letters, which take the same two columns.
+                _ => pick('ａ', next(26)),
+            })
+        })
+        .collect()
 }
 
 /// Formats a Unix-millisecond timestamp as local `HH:MM`.
@@ -902,7 +1057,7 @@ mod tests {
         app.absorb(line(1, "real one"), false);
         app.absorb(line(2, "fake one"), false);
 
-        let (lines, _) = build_transcript(&app, 80);
+        let (lines, _) = build_transcript(&app, 80, 0, None);
         let text: Vec<String> = lines
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
@@ -919,7 +1074,162 @@ mod tests {
 
     #[test]
     fn name_colors_are_stable() {
-        assert_eq!(name_color("bmo"), name_color("bmo"));
+        assert_eq!(name_color("bmo", None), name_color("bmo", None));
+        assert_eq!(
+            name_color("bmo", Some([9; 32])),
+            name_color("x", Some([9; 32]))
+        );
+    }
+
+    #[test]
+    fn a_key_decides_the_color_not_the_name() {
+        // Find two keys that land on different colors; with 12 colors, a
+        // handful of tries is plenty.
+        let colors: std::collections::HashSet<_> = (0..16u8)
+            .map(|k| name_color("sam", Some([k; 32])))
+            .collect();
+        assert!(colors.len() > 1, "an impostor's key must be able to differ");
+    }
+
+    #[test]
+    fn nobody_else_can_be_drawn_in_your_color() {
+        let close = |a: Color, b: Color| match (a, b) {
+            (Color::Rgb(r1, g1, b1), Color::Rgb(r2, g2, b2)) => {
+                (r1 as i32 - r2 as i32).abs()
+                    + (g1 as i32 - g2 as i32).abs()
+                    + (b1 as i32 - b2 as i32).abs()
+                    < 60
+            }
+            _ => false,
+        };
+        for c in NAME_COLORS {
+            for reserved in [OWN, WARN, BAD, ACCENT] {
+                assert!(!close(c, reserved), "{c:?} is too close to {reserved:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn scrambling_keeps_the_shape_and_loses_the_text() {
+        let text = "Meet at 5, bring the key! 日本";
+        let jumbled = scramble(text, 42);
+        assert_ne!(jumbled, text);
+        assert_eq!(str_width(&jumbled), str_width(text), "{jumbled:?}");
+        let spaces = |s: &str| s.match_indices(' ').map(|(i, _)| i).collect::<Vec<_>>();
+        assert_eq!(spaces(&jumbled), spaces(text), "words keep their places");
+        assert!(jumbled.contains(','), "punctuation stays");
+        assert!(!jumbled.contains("key"));
+        assert_eq!(scramble(text, 42), jumbled, "the same every frame");
+        // The case shuffling can't hide.
+        assert_ne!(scramble("ok", 1), "ok");
+        assert_ne!(scramble("ok", 2), "ok");
+    }
+
+    fn chat_app() -> App {
+        let mut app = App::new(
+            std::path::PathBuf::from("/tmp/nope"),
+            Screen::Chat,
+            "wss://x/ws".into(),
+            true,
+        );
+        app.username = "bmo".into();
+        app
+    }
+
+    fn text_of(lines: &[Line]) -> String {
+        lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn old_messages_scramble_and_the_hovered_one_reveals() {
+        use rustchat_core::Payload;
+        let mut app = chat_app();
+        app.absorb(
+            Payload::Msg {
+                user: "sam".into(),
+                body: "the launch codes".into(),
+                ts: 0,
+            },
+            false,
+        );
+        let now = rustchat_core::proto::now_ms();
+        let fresh = text_of(&build_transcript(&app, 60, now, None).0);
+        assert!(fresh.contains("the launch codes"), "readable at first");
+
+        let later = now + crate::app::DEFAULT_SCRAMBLE_MS;
+        let (old, _) = build_transcript(&app, 60, later, None);
+        assert!(!text_of(&old).contains("launch"), "{}", text_of(&old));
+        let (shown, _) = build_transcript(&app, 60, later, Some(0));
+        assert!(text_of(&shown).contains("the launch codes"));
+        assert_eq!(old.len(), shown.len(), "revealing moves nothing");
+
+        app.scramble_after = None;
+        assert!(text_of(&build_transcript(&app, 60, later, None).0).contains("launch codes"));
+    }
+
+    #[test]
+    fn hovering_over_a_message_on_screen_reveals_it() {
+        use ratatui::backend::TestBackend;
+        use rustchat_core::Payload;
+        let mut app = chat_app();
+        app.scramble_after = Some(1); // Everything is old by the time it's drawn.
+        app.absorb(
+            Payload::Msg {
+                user: "sam".into(),
+                body: "top secret".into(),
+                ts: 0,
+            },
+            false,
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let screen = |app: &App| {
+            let mut terminal = ratatui::Terminal::new(TestBackend::new(40, 10)).unwrap();
+            terminal.draw(|f| draw(f, app)).unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            buffer
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>()
+        };
+        assert!(!screen(&app).contains("top secret"));
+        // Row 0 is the header; a short transcript draws from the top of the
+        // body, so the name is on row 1 and the text on row 2.
+        app.hover = Some((5, 2));
+        assert!(screen(&app).contains("top secret"));
+        app.hover = Some((5, 5)); // Empty space below it.
+        assert!(!screen(&app).contains("top secret"));
+        app.hover = Some((5, 8)); // Over the input box.
+        assert!(!screen(&app).contains("top secret"));
+    }
+
+    #[test]
+    fn the_typing_line_names_who() {
+        use crate::app::Typist;
+        let mut app = chat_app();
+        let now = 100_000;
+        assert!(typing_line(&app, now).is_none());
+        app.typing
+            .insert("sam".into(), Typist { at: now, key: None });
+        let one = typing_line(&app, now).unwrap().to_string();
+        assert!(one.contains("sam is typing"), "{one}");
+        app.typing
+            .insert("alex".into(), Typist { at: now, key: None });
+        let two = typing_line(&app, now).unwrap().to_string();
+        assert!(two.contains("alex and sam are typing"), "{two}");
+        assert!(
+            typing_line(&app, now + crate::app::TYPING_LAPSE_MS).is_none(),
+            "lapses without repeats"
+        );
     }
 
     #[test]

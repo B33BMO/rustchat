@@ -265,6 +265,10 @@ fn print_payload(
     replay: bool,
 ) -> std::io::Result<()> {
     let payload = &incoming.payload;
+    // Typing indicators are for a live screen; in a log they're noise.
+    if payload.is_transient() {
+        return Ok(());
+    }
     if json {
         let mut value = serde_json::to_value(payload).map_err(std::io::Error::other)?;
         value["replay"] = replay.into();

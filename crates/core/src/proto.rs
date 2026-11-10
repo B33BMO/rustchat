@@ -36,6 +36,12 @@ pub enum ClientMsg {
     Auth { v: u16, proof: String, room: String },
     /// Publishes a sealed payload to the room.
     Send { env: SealedEnvelope },
+    /// Passes a sealed payload to whoever is in the room right now, without
+    /// adding it to the backlog — for things like typing indicators, which
+    /// mean nothing a minute later and would otherwise push real lines out of
+    /// a bounded history. A relay that predates this ignores it, so the worst
+    /// an older relay does is drop the indicator.
+    Signal { env: SealedEnvelope },
     /// Keepalive.
     Ping,
 }
@@ -79,6 +85,10 @@ pub enum Payload {
     Join { user: String, ts: i64 },
     /// Announced by a client on a clean exit.
     Leave { user: String, ts: i64 },
+    /// The sender is composing a message. Repeated every few seconds while
+    /// they type; receivers let it lapse when the repeats stop. Sent as a
+    /// [`ClientMsg::Signal`], so it never lands in the relay's backlog.
+    Typing { user: String, ts: i64 },
 }
 
 impl Payload {
@@ -87,14 +97,24 @@ impl Payload {
         match self {
             Payload::Msg { user, .. }
             | Payload::Join { user, .. }
-            | Payload::Leave { user, .. } => user,
+            | Payload::Leave { user, .. }
+            | Payload::Typing { user, .. } => user,
         }
     }
 
     pub fn ts(&self) -> i64 {
         match self {
-            Payload::Msg { ts, .. } | Payload::Join { ts, .. } | Payload::Leave { ts, .. } => *ts,
+            Payload::Msg { ts, .. }
+            | Payload::Join { ts, .. }
+            | Payload::Leave { ts, .. }
+            | Payload::Typing { ts, .. } => *ts,
         }
+    }
+
+    /// Whether this only matters to whoever is in the room right now, and so
+    /// goes out as a [`ClientMsg::Signal`] rather than into the backlog.
+    pub fn is_transient(&self) -> bool {
+        matches!(self, Payload::Typing { .. })
     }
 }
 
@@ -218,6 +238,33 @@ mod tests {
         let back: Payload = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
         assert_eq!(back.user(), "bmo");
         assert_eq!(back.ts(), 42);
+    }
+
+    #[test]
+    fn only_typing_is_transient() {
+        assert!(
+            Payload::Typing {
+                user: "bmo".into(),
+                ts: 0
+            }
+            .is_transient()
+        );
+        assert!(
+            !Payload::Msg {
+                user: "bmo".into(),
+                body: "hi".into(),
+                ts: 0
+            }
+            .is_transient()
+        );
+        let json = serde_json::to_string(&ClientMsg::Signal {
+            env: SealedEnvelope {
+                n: "a".into(),
+                c: "b".into(),
+            },
+        })
+        .unwrap();
+        assert!(json.contains("\"t\":\"signal\""), "{json}");
     }
 
     #[test]

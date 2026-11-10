@@ -377,8 +377,17 @@ async fn chat(cli: Cli) -> Result<()> {
     // Focus reports are what let a mention notify only when you're elsewhere.
     // A terminal that doesn't support them just never sends any.
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableFocusChange);
+    // Mouse reporting is what lets hovering unscramble a message. It costs
+    // the terminal's own click-to-select, which most terminals give back
+    // with Shift held.
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
+    release_mouse_on_panic();
     let result = run(&mut terminal, &mut app, cli, pending).await;
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableFocusChange);
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::DisableMouseCapture,
+        crossterm::event::DisableFocusChange
+    );
     ratatui::restore();
 
     // Persisting after the terminal is restored means a failure here is
@@ -387,6 +396,21 @@ async fn chat(cli: Cli) -> Result<()> {
         eprintln!("warning: could not save your vault: {err:#}");
     }
     result
+}
+
+/// Turns mouse reporting off if the client panics. ratatui's own hook puts
+/// the screen back but knows nothing of the mouse, and a shell left with it
+/// on prints an escape sequence for every twitch of the pointer.
+fn release_mouse_on_panic() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::event::DisableMouseCapture,
+            crossterm::event::DisableFocusChange
+        );
+        previous(info);
+    }));
 }
 
 /// A connection resolved from the command line, with the keys kept alongside
@@ -489,8 +513,16 @@ async fn run(
         let action = tokio::select! {
             input = events.next() => match input {
                 Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => app.on_key(key),
+                Some(Ok(Event::Mouse(mouse))) => { app.on_mouse(mouse); Action::None }
                 Some(Ok(Event::FocusGained)) => { app.focused = Some(true); Action::None }
-                Some(Ok(Event::FocusLost)) => { app.focused = Some(false); Action::None }
+                // Terminals don't say when the pointer leaves the window, but
+                // they do say when focus goes. Without this, whatever the
+                // pointer last rested on would stay readable while you're away.
+                Some(Ok(Event::FocusLost)) => {
+                    app.focused = Some(false);
+                    app.hover = None;
+                    Action::None
+                }
                 // A resize or a paste just needs the redraw at the top of the
                 // loop; anything else we ignore.
                 Some(Ok(_)) => Action::None,
@@ -730,6 +762,9 @@ async fn do_unlock(
         .encode(),
     );
     app.notify = app::Notify::parse(&data.notify).unwrap_or(app::Notify::Mentions);
+    app.scramble_after =
+        app::parse_scramble(&data.scramble).unwrap_or(Some(app::DEFAULT_SCRAMBLE_MS));
+    app.share_typing = !data.hide_typing;
     app.vault = data;
     app.screen = Screen::Chat;
     app.load_history();
@@ -780,6 +815,8 @@ async fn do_finish_setup(
         notify: String::new(),
         identity_b64: encode_b64(&identity.to_bytes()),
         known_keys: Default::default(),
+        scramble: String::new(),
+        hide_typing: false,
     };
     let identity_public = identity.public();
     let conn = net::Connection {

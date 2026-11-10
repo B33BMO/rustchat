@@ -160,6 +160,8 @@ fn signing_bytes(room_id: &[u8; 32], payload: &Payload) -> Vec<u8> {
         Payload::Msg { user, body, ts } => (0u8, user, body.as_str(), ts),
         Payload::Join { user, ts } => (1, user, "", ts),
         Payload::Leave { user, ts } => (2, user, "", ts),
+        // Its own kind, so a signed indicator can't be passed off as a join.
+        Payload::Typing { user, ts } => (3, user, "", ts),
     };
     let mut out = Vec::with_capacity(CONTEXT.len() + 32 + 1 + 8 + user.len() + body.len() + 8);
     out.extend_from_slice(CONTEXT);

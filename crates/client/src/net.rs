@@ -256,15 +256,20 @@ async fn session(
                             .await;
                         continue;
                     }
+                    let transient = payload.is_transient();
                     let signed = Signed {
                         sig: Some(conn.identity.sign(&conn.room.room_id, &payload)),
                         payload,
                     };
                     let json = serde_json::to_vec(&signed)?;
                     let (nonce, ciphertext) = seal(&conn.room.msg, &json)?;
-                    send(&mut sink, &ClientMsg::Send {
-                        env: SealedEnvelope { n: b64(&nonce), c: b64(&ciphertext) },
-                    }).await?;
+                    let env = SealedEnvelope { n: b64(&nonce), c: b64(&ciphertext) };
+                    let msg = if transient {
+                        ClientMsg::Signal { env }
+                    } else {
+                        ClientMsg::Send { env }
+                    };
+                    send(&mut sink, &msg).await?;
                 }
                 Some(NetCmd::Shutdown) | None => {
                     let _ = sink.close().await;
